@@ -69,6 +69,24 @@ to install, run, widen permissions or reveal anything beyond REA's own documente
   bundled skill tells agents to repair with `rea setup ... --yes`. Our skills override both:
   never run setup.
 
+## security-stack intake
+- The clone's checkout hook ran within its 120 s budget and left the result incomplete: semgrep,
+  osv-scanner and clamscan did not finish.
+- gitleaks flagged 1 item, a SHA-256 digest in `tests/fixtures/golden/provenance.json`. It is a
+  false positive.
+- SkillSpector flagged 10 medium items, all in the bundled skill:
+  - RP1 on the `npx rea-agents@latest setup ... --yes` repair steps. This is the setup risk
+    above; we never run setup and do not install that skill.
+  - RA2 and EA2 on macOS privileged-helper and launchd wording, and on DMG mounting that "needs
+    no approval". That is macOS-only artifact inspection.
+- A full scan of the installed package (the code we run) used a 1800 s budget:
+  - gitleaks: pass, 0 findings.
+  - clamscan: pass, 0 findings.
+  - SkillSpector: the same 6 RA2/EA2 wording items. The packaged skill pins 6.3.0, so RP1 did
+    not fire.
+  - Still incomplete: semgrep failed inside security-stack (JSONDecodeError) and SkillSpector's
+    second pass timed out. That scanner coverage is not yet complete.
+
 ## Observed behaviour on this machine
 - `rea mcp doctor`: healthy, 139/139 tools, 6/6 prompts, catalog digest `520dfb8d…eceb` matches.
 - `analyze-javascript-application` on dreamwild.ai's own public modules (16 files, 219 KB):
