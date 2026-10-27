@@ -5,13 +5,14 @@ import type { BrowserContext, Page } from "playwright-core";
 
 import type { BrowserScenario } from "../domain/browserScenario.js";
 import {
+  BROWSER_STORAGE_FINGERPRINT_VERSION,
   browserStepArtifactsSchema,
   type BrowserStepArtifacts,
 } from "../domain/browserScenarioCaptureValues.js";
 import type { BrowserScenarioSecrets } from "./BrowserScenarioSecrets.js";
 
 const historyValueSchema = z.strictObject({
-  length: z.number().int().min(0),
+  length: z.int().min(0),
   navigation_entries: z.array(
     z.strictObject({
       type: z.string(),
@@ -154,21 +155,22 @@ const captureStorage = async (input: {
       }))()`),
     );
     const value = {
+      fingerprint_version: BROWSER_STORAGE_FINGERPRINT_VERSION,
       cookies: cookies.map((cookie) => ({
-        name: cookie.name,
-        domain: cookie.domain,
-        path: cookie.path,
+        name: secrets.redact(cookie.name),
+        domain: secrets.redact(cookie.domain),
+        path: secrets.redact(cookie.path),
         secure: cookie.secure,
         http_only: cookie.httpOnly,
         same_site: cookie.sameSite,
         ...secrets.fingerprint(cookie.value),
       })),
       local_storage: pageStorage.local_storage.map(([name, value]) => ({
-        name,
+        name: secrets.redact(name),
         ...secrets.fingerprint(value),
       })),
       session_storage: pageStorage.session_storage.map(([name, value]) => ({
-        name,
+        name: secrets.redact(name),
         ...secrets.fingerprint(value),
       })),
     };

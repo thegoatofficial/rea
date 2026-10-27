@@ -913,6 +913,56 @@ async function inspect(mode, input, errorCategory) {
     }
     assert.notEqual(result.isError, true, mcpTextValue(result));
     assertSensitiveLimitations(value, input.sensitive_values ?? []);
+    if (input.format === "har") {
+      const surface = await client.callTool({
+        name: "inspect_analysis_view",
+        arguments: {
+          source: { kind: "retained-evidence", evidence_id: value.evidence_id },
+          view: { kind: "api-surface" },
+        },
+      });
+      if ((input.sensitive_values ?? []).length > 0) {
+        // Derived view text cannot be checked against undisclosed declarations.
+        assert.equal(surface.isError, true);
+        const refused = JSON.parse(mcpTextValue(surface));
+        for (const literal of input.sensitive_values)
+          assert.ok(!JSON.stringify(refused).includes(literal));
+      } else {
+        assert.notEqual(surface.isError, true, mcpTextValue(surface));
+        const projected = JSON.parse(mcpTextValue(surface));
+        assert.equal(projected.normalized_result.kind, "api-surface");
+        assert.equal(
+          projected.normalized_result.records.examined,
+          value.normalized_result.records.length,
+        );
+      }
+      const manifest = await client.callTool({
+        name: "inspect_analysis_view",
+        arguments: {
+          source: { kind: "retained-evidence", evidence_id: value.evidence_id },
+          view: { kind: "environment-manifest" },
+        },
+      });
+      if ((input.sensitive_values ?? []).length > 0) {
+        assert.equal(manifest.isError, true);
+        const refusedManifest = JSON.parse(mcpTextValue(manifest));
+        for (const literal of input.sensitive_values)
+          assert.ok(!JSON.stringify(refusedManifest).includes(literal));
+      } else {
+        assert.notEqual(manifest.isError, true, mcpTextValue(manifest));
+        const projected = JSON.parse(mcpTextValue(manifest));
+        assert.equal(projected.normalized_result.kind, "environment-manifest");
+        assert.equal(projected.normalized_result.unknowns.length, 3);
+        for (const record of projected.normalized_result.records)
+          assert.deepEqual(Object.keys(record).sort(), [
+            "content_type",
+            "method",
+            "ordinal",
+            "path",
+            "status",
+          ]);
+      }
+    }
     return value.normalized_result;
   }
   const args = [

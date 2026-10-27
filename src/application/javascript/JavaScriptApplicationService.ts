@@ -1,18 +1,24 @@
+import type { AnalysisSettingsReader } from "../../domain/analysisSettings.js";
+import {
+  ASAR_HEADER_ADMISSION_SETTING,
+  parseAsarHeaderAdmission,
+} from "../../config/asarHeaderAdmission.js";
 import { z } from "zod";
 
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import { translateArtifactFailure } from "../../artifacts/ArtifactOperationFailure.js";
+import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import {
   analyzeJavaScriptApplicationInputSchema,
+  type JavaScriptApplicationAnalysisResult,
   parseOwnedJavaScriptApplicationAnalysisSteps,
 } from "../../domain/javascript/javascriptApplicationAnalysis.js";
 import {
   AnalysisAccessDeniedError,
-  AnalysisInputError,
   AnalysisOutputError,
-  AnalysisUnsupportedTargetError,
 } from "../../domain/analysisErrorCore.js";
 import { ArtifactOperationError } from "../../domain/artifactOperationError.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { Evidence } from "../../domain/evidence.js";
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
 import { err, ok, type Result } from "../../domain/result.js";
@@ -24,29 +30,54 @@ import {
   checkpointJavaScriptAnalysis,
   completeJavaScriptAnalysisSteps,
 } from "./JavaScriptAnalysisControl.js";
-import { reconstructJavaScriptArtifact } from "./JavaScriptArtifactReconstruction.js";
-import { JAVASCRIPT_APPLICATION_PROVIDER } from "../InvestigationProviders.js";
+import {
+  reconstructJavaScriptArtifact,
+  type JavaScriptArtifactReconstructionResult,
+} from "./JavaScriptArtifactReconstruction.js";
+import { JAVASCRIPT_APPLICATION_PROVIDER } from "../../domain/investigationProviders.js";
 
 const OPERATION = "analyze_javascript_application" as const;
+
+/** Execution options plus the composition root's environment for admission settings. */
+export interface JavaScriptApplicationOptions extends ExecutionOptions {
+  readonly settings?: AnalysisSettingsReader;
+  readonly environment?: Readonly<Record<string, string | undefined>>;
+}
 
 /** Statically analyze one local JavaScript/Electron application. */
 export const analyzeJavaScriptApplication = async (
   rawInput: unknown,
-  options: ExecutionOptions = {},
+  scope: ArtifactResourceScope,
+  options: JavaScriptApplicationOptions = {},
 ): Promise<Result<Evidence, AnalysisError>> => {
   const parsed = analyzeJavaScriptApplicationInputSchema.safeParse(rawInput);
   if (!parsed.success)
     return err(
       analysisInputErrorFromIssues(OPERATION, parsed.error.issues, rawInput),
     );
-  return analyzeJavaScriptApplicationValidated(parsed.data, options);
+  return analyzeJavaScriptApplicationValidated(parsed.data, scope, options);
 };
 
 /** Analyze input already parsed by a trusted adapter boundary. */
 export const analyzeJavaScriptApplicationValidated = async (
   input: z.output<typeof analyzeJavaScriptApplicationInputSchema>,
-  options: ExecutionOptions = {},
+  scope: ArtifactResourceScope,
+  options: JavaScriptApplicationOptions = {},
 ): Promise<Result<Evidence, AnalysisError>> => {
+  // An invalid setting is refused before analysis, never replaced by the default.
+  const asarHeaderAdmission = parseAsarHeaderAdmission(
+    options.environment?.[ASAR_HEADER_ADMISSION_SETTING],
+  );
+  if (!asarHeaderAdmission.ok) return asarHeaderAdmission;
+  const overrides = options.settings?.().overrides;
+  const header = overrides?.["asar.max_header_bytes"];
+  const acceptedAdmission =
+    header === undefined
+      ? asarHeaderAdmission.value
+      : { maximumBytes: header, source: "runtime" as const };
+  let reconstructed: JavaScriptArtifactReconstructionResult | undefined;
+  let result: JavaScriptApplicationAnalysisResult | undefined;
+  let evidence: Evidence | undefined;
   try {
     assertJavaScriptAnalysisActive(options.signal);
     await options.progress?.report({
@@ -56,14 +87,13 @@ export const analyzeJavaScriptApplicationValidated = async (
       message: "Inventorying and parsing application artifacts",
     });
     await checkpointJavaScriptAnalysis(options.signal);
-    const reconstructed = await reconstructJavaScriptArtifact(
-      {
-        input_path: input.input_path,
-        format: input.format,
-        integrity_policy: input.integrity_policy,
-      },
+    reconstructed = await reconstructJavaScriptArtifact(
+      input,
+      scope,
       options.signal,
       options.progress,
+      acceptedAdmission,
+      overrides,
     );
     const { electron_summary: summary, ...application } = reconstructed;
     await options.progress?.report({
@@ -73,7 +103,7 @@ export const analyzeJavaScriptApplicationValidated = async (
       message: "Validating result metadata and cross-graph bindings",
     });
     await checkpointJavaScriptAnalysis(options.signal);
-    const result = await completeJavaScriptAnalysisSteps(
+    result = await completeJavaScriptAnalysisSteps(
       parseOwnedJavaScriptApplicationAnalysisSteps({
         ...application,
         summary,
@@ -88,13 +118,12 @@ export const analyzeJavaScriptApplicationValidated = async (
       message: "Creating and hashing application analysis Evidence",
     });
     await checkpointJavaScriptAnalysis(options.signal);
-    const evidence =
-      await createOwnedJavaScriptApplicationEvidenceCooperatively(
-        input,
-        result,
-        options.signal,
-        options.progress,
-      );
+    evidence = await createOwnedJavaScriptApplicationEvidenceCooperatively(
+      input,
+      result,
+      options.signal,
+      options.progress,
+    );
     await checkpointJavaScriptAnalysis(options.signal);
     await options.progress?.report({
       phase: "analyze_javascript_application",
@@ -106,22 +135,42 @@ export const analyzeJavaScriptApplicationValidated = async (
     assertJavaScriptAnalysisActive(options.signal);
     return ok(evidence);
   } catch (cause: unknown) {
-    // Input selection failures are already typed by their cause.
     if (
-      cause instanceof AnalysisInputError ||
-      cause instanceof AnalysisUnsupportedTargetError ||
-      cause instanceof AnalysisAccessDeniedError
-    )
-      return err(cause);
+      cause instanceof ArtifactReaderFailure &&
+      cause.reason === "cancelled" &&
+      reconstructed !== undefined
+    ) {
+      try {
+        if (result === undefined) {
+          const { electron_summary: summary, ...application } = reconstructed;
+          result = await completeJavaScriptAnalysisSteps(
+            parseOwnedJavaScriptApplicationAnalysisSteps({
+              ...application,
+              summary,
+              limitations: reconstructed.graph.limitations,
+            }),
+          );
+        }
+        evidence ??=
+          await createOwnedJavaScriptApplicationEvidenceCooperatively(
+            input,
+            result,
+          );
+        return err(
+          translateArtifactFailure(OPERATION, cause).retainPartialObservation(
+            evidence,
+          ),
+        );
+      } catch (completionCause: unknown) {
+        // A validation or Evidence failure while finishing the partial result
+        // remains the primary failure instead of being hidden by cancellation.
+        cause = completionCause;
+      }
+    }
+    // Preserve execution constraints and their completed partial Evidence.
+    if (cause instanceof AnalysisError) return err(cause);
     if (cause instanceof ArtifactReaderFailure)
-      return err(
-        new ArtifactOperationError(
-          OPERATION,
-          cause.reason,
-          cause.details,
-          cause.message,
-        ),
-      );
+      return err(translateArtifactFailure(OPERATION, cause));
     if (cause instanceof z.ZodError)
       return err(
         new AnalysisOutputError(OPERATION, describeResultSchemaFailure(cause), {
@@ -133,8 +182,32 @@ export const analyzeJavaScriptApplicationValidated = async (
       "code" in cause &&
       typeof cause.code === "string" &&
       FILESYSTEM_ERROR_CODES.has(cause.code)
-    )
-      return err(new ArtifactOperationError(OPERATION, "io"));
+    ) {
+      const path: unknown = Reflect.get(cause, "path");
+      const syscall: unknown = Reflect.get(cause, "syscall");
+      const diagnostics = {
+        input_path: input.input_path,
+        system_code: cause.code,
+        ...(typeof path === "string" ? { path } : {}),
+        ...(typeof syscall === "string" ? { syscall } : {}),
+      };
+      return err(
+        cause.code === "EACCES" || cause.code === "EPERM"
+          ? new AnalysisAccessDeniedError(
+              OPERATION,
+              input.input_path,
+              cause.code,
+              { cause, diagnostics },
+            )
+          : new ArtifactOperationError(
+              OPERATION,
+              "io",
+              undefined,
+              cause.message,
+              { cause, diagnostics },
+            ),
+      );
+    }
     return err(
       new ProviderAdapterError(JAVASCRIPT_APPLICATION_PROVIDER.id, OPERATION, {
         cause,

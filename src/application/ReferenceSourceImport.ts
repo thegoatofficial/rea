@@ -1,21 +1,33 @@
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import {
   createHistoricalSourceGraph,
+  historicalSourceInventoryHasPartialFacts,
   historicalSourceLanguages,
   historicalSourceManifests,
   historicalSourceParseFailureKey,
+  historicalSourceRelationshipKey,
   type HistoricalSourceGraph,
   type HistoricalSourceGraphInput,
 } from "../domain/referenceSourceGraph.js";
 import { err, ok, type Result } from "../domain/result.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import type { AnalysisCleanupObservation } from "../domain/analysisErrorBase.js";
 import { readReferenceSource } from "../reference/ReferenceSourceReader.js";
+import type {
+  ReferenceSourceExclusionKind,
+  ReferenceSourceRead,
+  ReferenceSourceReaderError,
+} from "../reference/ReferenceSourceReaderTypes.js";
 import { parseReferenceSourceEntries } from "./ReferenceSourceImportEntries.js";
 import { readReferenceSourceVcs } from "./ReferenceSourceVcsAdapter.js";
-import {
-  type ReferenceSourceImportError,
-  type ReferenceSourceImportOptions,
+import type {
+  ReferenceSourceImportError,
+  ReferenceSourceImportOptions,
 } from "./ReferenceSourceImportTypes.js";
-import { prepareReferenceSourceImport } from "./ReferenceSourceImportPolicy.js";
+import {
+  prepareReferenceSourceImport,
+  type PreparedReferenceSourceImport,
+} from "./ReferenceSourceImportPolicy.js";
 
 const failure = (
   code: ReferenceSourceImportError["code"],
@@ -26,15 +38,14 @@ const failure = (
   message,
 });
 
-const cancelled = (): ReferenceSourceImportError =>
-  failure("cancelled", "Reference source import cancelled");
+const cancelled = (
+  partial?: ReferenceSourceRead,
+): ReferenceSourceImportError => ({
+  ...failure("cancelled", "Reference source import cancelled"),
+  ...(partial === undefined ? {} : { partial }),
+});
 
 const isAborted = (signal?: AbortSignal): boolean => signal?.aborted === true;
-
-const relationshipKey = (
-  relationship: HistoricalSourceGraphInput["relationships"][number],
-): string =>
-  `${relationship.from_path}\u0000${relationship.to}\u0000${relationship.kind}\u0000${relationship.resolution}\u0000${relationship.parse_state}`;
 
 const deduplicateRelationships = (
   relationships: HistoricalSourceGraphInput["relationships"],
@@ -42,7 +53,7 @@ const deduplicateRelationships = (
   const seen = new Set<string>();
   const result: HistoricalSourceGraphInput["relationships"] = [];
   for (const relationship of relationships) {
-    const key = relationshipKey(relationship);
+    const key = historicalSourceRelationshipKey(relationship);
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(relationship);
@@ -79,44 +90,72 @@ const buildProvenance = (
   caller: options.caller,
 });
 
-const deriveInventoryState = (
-  input: Pick<
-    HistoricalSourceGraphInput,
-    | "entries"
-    | "relationships"
-    | "parse_failures"
-    | "exclusions"
-    | "limitations"
-  >,
-): "complete" | "partial" | "unknown" => {
-  if (input.limitations.length > 0) return "partial";
-  if (input.exclusions.length > 0) return "partial";
-  if (input.parse_failures.length > 0) return "partial";
-  const partialEntry = input.entries.some(
-    (entry) =>
-      entry.limitations.length > 0 ||
-      (entry.kind === "file" && entry.content_state !== "hashed") ||
-      (entry.kind === "directory" && entry.tree_state !== "enumerated") ||
-      (entry.kind === "symlink" && entry.target_state !== "internal"),
-  );
-  if (partialEntry) return "partial";
-  const partialRelationship = input.relationships.some(
-    ({ parse_state, resolution }) =>
-      parse_state !== "parsed" ||
-      ["unresolved", "unknown"].includes(resolution),
-  );
-  if (partialRelationship) return "partial";
-  return "complete";
-};
-
 const sortExclusions = (
   exclusions: HistoricalSourceGraphInput["exclusions"],
 ): HistoricalSourceGraphInput["exclusions"] =>
   [...exclusions].sort((left, right) => {
     const byPath = compareUnicodeCodePoints(left.path, right.path);
     if (byPath !== 0) return byPath;
-    return compareUnicodeCodePoints(left.reason, right.reason);
+    const byReason = compareUnicodeCodePoints(left.reason, right.reason);
+    if (byReason !== 0) return byReason;
+    return compareUnicodeCodePoints(
+      "pattern" in left ? left.pattern : "",
+      "pattern" in right ? right.pattern : "",
+    );
   });
+
+const createShouldExclude =
+  (
+    exclusions: HistoricalSourceGraphInput["exclusions"],
+    secrets: PreparedReferenceSourceImport["secrets"],
+    ignored: PreparedReferenceSourceImport["ignored"],
+  ): ((path: string, kind: ReferenceSourceExclusionKind) => boolean) =>
+  (path, kind) => {
+    // An entry of unknown kind may be a directory, so directory-only rules
+    // must still exclude it; this fails closed for caller-marked secrets.
+    const patternPaths =
+      kind === "directory"
+        ? [`${path}/`]
+        : kind === "unknown"
+          ? [path, `${path}/`]
+          : [path];
+    const firstMatch = (matcher: Pick<typeof secrets, "test">) => {
+      const results = patternPaths.map((patternPath) =>
+        matcher.test(patternPath),
+      );
+      return results.find(({ ignored }) => ignored) ?? results[0];
+    };
+    const secretMatch = firstMatch(secrets);
+    if (secretMatch?.ignored === true) {
+      if (!secretMatch.rule)
+        throw new Error(`Ignored secret path has no matching rule: ${path}`);
+      exclusions.push({
+        path,
+        entry_kind: kind,
+        reason: "configured-secret",
+        pattern: secretMatch.rule.pattern,
+      });
+      return true;
+    }
+    const match = firstMatch(ignored);
+    if (match?.ignored !== true) return false;
+    if (!match.rule)
+      throw new Error(`Ignored path has no matching rule: ${path}`);
+    const reason = match.rule.mark;
+    if (
+      reason !== "project-ignored" &&
+      reason !== "default-ignored" &&
+      reason !== "caller-excluded"
+    )
+      throw new Error(`Ignored path has unknown rule origin: ${path}`);
+    exclusions.push({
+      path,
+      entry_kind: kind,
+      reason,
+      pattern: match.rule.pattern,
+    });
+    return true;
+  };
 
 /**
  * Import a reference source directory into a committed historical source graph.
@@ -127,43 +166,42 @@ const sortExclusions = (
  */
 export const importReferenceSource = async (
   options: ReferenceSourceImportOptions,
+  resources: ArtifactResourceScope,
 ): Promise<Result<HistoricalSourceGraph, ReferenceSourceImportError>> => {
   if (isAborted(options.signal)) return err(cancelled());
-  const prepared = await prepareReferenceSourceImport(options);
+  const prepared = await prepareReferenceSourceImport(options, resources);
   if (!prepared.ok) return prepared;
   const { ignored, root, secrets } = prepared.value;
   if (isAborted(options.signal)) return err(cancelled());
 
   const exclusions: HistoricalSourceGraphInput["exclusions"] = [];
-  const shouldExclude = (path: string): boolean => {
-    if (secrets.ignores(path)) {
-      exclusions.push({ path, reason: "configured-secret" });
-      return true;
-    }
-    if (ignored.ignores(path)) {
-      exclusions.push({ path, reason: "caller-excluded" });
-      return true;
-    }
-    return false;
-  };
+  const shouldExclude = createShouldExclude(exclusions, secrets, ignored);
 
-  const [readResult, vcs] = await Promise.all([
-    readReferenceSource(root, {
+  const [readResult, vcsResult] = await Promise.all([
+    readReferenceSource(root, resources, {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       shouldExclude,
+      beforeDirectory: prepared.value.beforeDirectory,
     }),
-    readReferenceSourceVcs(root, options.signal),
+    readReferenceSourceVcs(root, resources, options.signal),
   ]);
 
-  if (!readResult.ok) {
-    const error = readResult.error;
-    if (error.code === "cancelled") return err(cancelled());
-    if (error.code === "unsupported")
-      return err(failure("unsupported", error.message));
-    return err(failure("io", error.message));
-  }
+  if (!readResult.ok)
+    return err(
+      combineReadFailures(
+        readResult.error,
+        vcsResult.ok ? undefined : vcsResult.error,
+        readResult.error.partial,
+      ),
+    );
+  if (!vcsResult.ok)
+    return err(
+      combineReadFailures(vcsResult.error, undefined, readResult.value),
+    );
 
-  if (isAborted(options.signal)) return err(cancelled());
+  const vcs = vcsResult.value;
+
+  if (isAborted(options.signal)) return err(cancelled(readResult.value));
 
   const read = readResult.value;
   const filePaths = new Set(
@@ -173,9 +211,9 @@ export const importReferenceSource = async (
   );
 
   const { entries, relationships, parseFailures, limitations } =
-    parseReferenceSourceEntries(read, filePaths, options.signal);
+    parseReferenceSourceEntries(read, filePaths, exclusions, options.signal);
 
-  if (isAborted(options.signal)) return err(cancelled());
+  if (isAborted(options.signal)) return err(cancelled(read));
 
   const uniqueRelationships = deduplicateRelationships(relationships);
   const uniqueFailures = normalizeHistoricalSourceParseFailures(parseFailures);
@@ -190,16 +228,21 @@ export const importReferenceSource = async (
     schema: "HistoricalSourceGraph",
     authority: "historical-reference",
     root_alias: "$REFERENCE_ROOT",
-    inventory_state: deriveInventoryState({
+    inventory_state: historicalSourceInventoryHasPartialFacts({
       entries: sortedEntries,
       relationships: uniqueRelationships,
       parse_failures: uniqueFailures,
       exclusions: sortedExclusions,
       limitations: sortedLimitations,
-    }),
+    })
+      ? "partial"
+      : "complete",
     entries: sortedEntries,
     relationships: uniqueRelationships.sort((left, right) =>
-      compareUnicodeCodePoints(relationshipKey(left), relationshipKey(right)),
+      compareUnicodeCodePoints(
+        historicalSourceRelationshipKey(left),
+        historicalSourceRelationshipKey(right),
+      ),
     ),
     parse_failures: uniqueFailures,
     exclusions: sortedExclusions,
@@ -220,4 +263,46 @@ export const importReferenceSource = async (
       ),
     );
   }
+};
+
+const combineReadFailures = (
+  primary: ReferenceSourceReaderError,
+  other: ReferenceSourceReaderError | undefined,
+  partial: ReferenceSourceRead | undefined,
+): ReferenceSourceImportError => {
+  const code =
+    primary.code === "cancelled" || other?.code === "cancelled"
+      ? "cancelled"
+      : primary.code;
+  const cleanup = mergeCleanup(primary.cleanup, other?.cleanup);
+  const message =
+    other === undefined
+      ? primary.message
+      : `${primary.message}; additional reference metadata failure: ${other.message}`;
+  const cause =
+    other === undefined
+      ? primary.cause
+      : new AggregateError(
+          [primary, other],
+          "Reference source inventory and metadata both failed",
+          { cause: primary },
+        );
+  return {
+    ...failure(code, message),
+    ...(cleanup === undefined ? {} : { cleanup }),
+    ...(partial === undefined ? {} : { partial }),
+    ...(cause === undefined ? {} : { cause }),
+  };
+};
+
+const mergeCleanup = (
+  first: AnalysisCleanupObservation | undefined,
+  second: AnalysisCleanupObservation | undefined,
+): AnalysisCleanupObservation | undefined => {
+  if (first === undefined) return second;
+  if (second === undefined) return first;
+  return {
+    reason: `${first.reason}; ${second.reason}`,
+    resources: [...new Set([...first.resources, ...second.resources])],
+  };
 };

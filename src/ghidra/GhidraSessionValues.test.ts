@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   GHIDRA_SESSION_CAPABILITIES,
+  GHIDRA_MUTATING_OPERATIONS,
   parseGhidraSessionInfo,
 } from "./GhidraSessionValues.js";
 
@@ -35,18 +36,143 @@ const session = (
   },
 });
 
+const rejectedHandshake = (value: ReturnType<typeof session>) => {
+  const parsed = parseGhidraSessionInfo(value, expected);
+  if (parsed.ok) throw new Error("expected an invalid Ghidra handshake");
+  return parsed.error;
+};
+
 describe("Ghidra DOS import commitment", () => {
   it("accepts the exact admitted real-mode language and compiler", () => {
-    expect(parseGhidraSessionInfo(session(), expected).ok).toBe(true);
+    const parsed = parseGhidraSessionInfo(session(), expected);
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value.target).toMatchObject({
+      language_id: expected.expectedLanguageId,
+      compiler_spec_id: expected.expectedCompilerSpecId,
+    });
   });
   it("rejects a 32-bit interpretation even when artifact and profile hashes match", () => {
-    expect(
-      parseGhidraSessionInfo(session("x86:LE:32:default"), expected).ok,
-    ).toBe(false);
+    expect(rejectedHandshake(session("x86:LE:32:default")).message).toBe(
+      "Ghidra bridge handshake identity is invalid",
+    );
   });
   it("rejects compiler drift independently of the language", () => {
+    expect(rejectedHandshake(session(undefined, "windows")).message).toBe(
+      "Ghidra bridge handshake identity is invalid",
+    );
+  });
+});
+
+describe("Ghidra PDB observations", () => {
+  const pdb = {
+    file: "C:\\build\\fixture.pdb",
+    guid: "01234567-89AB-CDEF-0123-456789ABCDEF",
+    age: "a",
+    signature: null,
+    version: "RSDS",
+    loaded: false,
+  };
+  it("retains the referenced identity and observed load state", () => {
+    const parsed = parseGhidraSessionInfo({ ...session(), pdb }, expected);
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value.pdb).toEqual(pdb);
+  });
+  it("preserves missing attributes as unknown", () => {
+    const unknown = Object.fromEntries(
+      Object.keys(pdb).map((key) => [key, null]),
+    );
+    const parsed = parseGhidraSessionInfo(
+      { ...session(), pdb: unknown },
+      expected,
+    );
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value.pdb).toEqual(unknown);
+  });
+  it.each([
+    { ...pdb, loaded: "false" },
+    { ...pdb, age: 1 },
+    {
+      guid: pdb.guid,
+      age: pdb.age,
+      signature: null,
+      version: "RSDS",
+      loaded: false,
+    },
+    { ...pdb, matched: true },
+  ])("rejects malformed PDB reports", (report) => {
     expect(
-      parseGhidraSessionInfo(session(undefined, "windows"), expected).ok,
+      parseGhidraSessionInfo({ ...session(), pdb: report }, expected).ok,
+    ).toBe(false);
+  });
+});
+
+describe("Ghidra MIPS soft-float storage report", () => {
+  const valid = {
+    policy: "o32-soft-float-prototype-v1",
+    functions: 2,
+    definitions: 1,
+  };
+  it("accepts the exact committed policy outcome", () => {
+    const parsed = parseGhidraSessionInfo(
+      { ...session(), mips_soft_float_storage: valid },
+      expected,
+    );
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value.mips_soft_float_storage).toEqual(valid);
+  });
+  it.each([
+    [
+      "the superseded storage policy",
+      { policy: "o32-integer-registers-v1", remapped: 2, retyped: 1 },
+    ],
+    ["a negative count", { ...valid, definitions: -1 }],
+    ["a fractional count", { ...valid, functions: 1.5 }],
+    ["a missing count", { policy: valid.policy, functions: 2 }],
+    ["an undeclared field", { ...valid, skipped: 0 }],
+    ["a non-object report", "functions"],
+  ])("rejects %s", (_label, report) => {
+    expect(
+      parseGhidraSessionInfo(
+        { ...session(), mips_soft_float_storage: report },
+        expected,
+      ).ok,
+    ).toBe(false);
+  });
+});
+
+describe("Ghidra disabled analyzer report", () => {
+  const valid = {
+    format: "rea-ghidra-disabled-analyzers-v1",
+    analyzers: [
+      { name: "Decompiler Switch Analysis", status: "disabled" },
+      { name: "Objective-C Message Analyzer", status: "not_applicable" },
+    ],
+  };
+  it("accepts disabled and not-applicable outcomes in configured order", () => {
+    const parsed = parseGhidraSessionInfo(
+      { ...session(), disabled_analyzers: valid },
+      expected,
+    );
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value.disabled_analyzers).toEqual(valid);
+  });
+  it.each([
+    [
+      "an unknown analyzer reported as accepted",
+      {
+        ...valid,
+        analyzers: [{ name: "REA Unknown Analyzer", status: "unknown" }],
+      },
+    ],
+    ["an empty outcome list", { ...valid, analyzers: [] }],
+    ["another report format", { ...valid, format: "rea-ghidra-seeds-v1" }],
+    ["an undeclared field", { ...valid, skipped: [] }],
+  ])("rejects %s", (_label, report) => {
+    expect(
+      parseGhidraSessionInfo(
+        { ...session(), disabled_analyzers: report },
+        expected,
+      ).ok,
     ).toBe(false);
   });
 });
@@ -81,7 +207,7 @@ describe("Ghidra mutation handshake", () => {
       ...value,
       read_only: true,
       capabilities: value.capabilities.filter(
-        (c) => c !== "annotate_native_function",
+        (c) => !GHIDRA_MUTATING_OPERATIONS.has(c),
       ),
     };
     expect(
@@ -91,5 +217,25 @@ describe("Ghidra mutation handshake", () => {
     expect(
       parseGhidraSessionInfo(value, { ...expected, expectedReadOnly: true }).ok,
     ).toBe(false);
+  });
+  it("treats address naming as database mutation", () => {
+    expect([...GHIDRA_MUTATING_OPERATIONS].sort()).toEqual([
+      "annotate_native_function",
+      "set_address_name",
+      "set_addresses_names",
+    ]);
+    const value = session();
+    for (const naming of ["set_address_name", "set_addresses_names"]) {
+      expect(value.capabilities).toContain(naming);
+      expect(
+        parseGhidraSessionInfo(
+          {
+            ...value,
+            capabilities: value.capabilities.filter((c) => c !== naming),
+          },
+          expected,
+        ).ok,
+      ).toBe(false);
+    }
   });
 });

@@ -5,8 +5,10 @@ import { ANALYSIS_SNAPSHOT_TARGET } from "./analysisSnapshot.fixture.js";
 import {
   createEvidenceBundle,
   createImmutableEvidenceBundle,
+  NonCanonicalEvidenceBundleError,
   evidenceBundleForTarget,
   parseEvidenceBundle,
+  safeParseEvidenceBundle,
 } from "./evidenceBundle.js";
 import {
   createResidualUnknown,
@@ -17,6 +19,47 @@ import {
 const provider = { id: "fixture", name: "Fixture", version: "1" };
 const targetDigest = "a".repeat(64);
 const foreignDigest = "b".repeat(64);
+
+describe("evidence bundle failure classification", () => {
+  it("tags valid-shaped bundles that fail canonical ordering", () => {
+    const records = ["first", "second"].map((label) =>
+      createEvidence(undefined, provider, {
+        operation: "observe",
+        parameters: { label },
+        result: { label },
+      }),
+    );
+    const canonical = createEvidenceBundle(records);
+    const parsed = safeParseEvidenceBundle({
+      ...canonical,
+      records: [...canonical.records].reverse(),
+    });
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error.kind).toBe("invalid-bundle");
+    expect(parsed.error.cause).toBeInstanceOf(NonCanonicalEvidenceBundleError);
+  });
+
+  it("treats only authenticated standalone Evidence as the wrong input kind", () => {
+    const record = createEvidence(undefined, provider, {
+      operation: "observe",
+      parameters: {},
+      result: { observed: true },
+    });
+    const single = safeParseEvidenceBundle(record);
+    expect(single.ok).toBe(false);
+    if (single.ok) return;
+    expect(single.error.kind).toBe("single-record");
+
+    const tampered = safeParseEvidenceBundle({
+      ...record,
+      normalized_result: { observed: false },
+    });
+    expect(tampered.ok).toBe(false);
+    if (tampered.ok) return;
+    expect(tampered.error.kind).toBe("invalid-bundle");
+  });
+});
 
 const makeUnknown = (
   question: string,

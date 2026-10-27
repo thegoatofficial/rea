@@ -3,7 +3,7 @@ import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import { AnalysisCapabilityUnavailableError } from "../../domain/analysisErrorCore.js";
 import { NoBinaryOpenError } from "../../domain/configurationErrors.js";
 import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import type { EvidenceSubjectTarget } from "../../domain/evidence.js";
 import { err, ok, type Result } from "../../domain/result.js";
@@ -13,7 +13,10 @@ import type {
   AnalysisOperation,
   CapabilityDescriptor,
 } from "../AnalysisProvider.js";
-import { isSnapshotCacheable } from "./AnalysisSnapshotCache.js";
+import {
+  isSnapshotCacheable,
+  requiresNativeSourceAdmissionBeforeReplay,
+} from "./AnalysisSnapshotCache.js";
 import type { SessionProviderRoute } from "./SessionProviderRouter.js";
 
 interface ActiveExecutionBinding {
@@ -35,6 +38,7 @@ interface PrepareSessionExecutionInput {
   readonly active: ActiveExecutionBinding | undefined;
   readonly operation: AnalysisOperation;
   readonly parameters: Readonly<Record<string, JsonValue>>;
+  readonly nativeSourceAdmitted: boolean;
   readonly unboundOperationError: (
     operation: AnalysisOperation,
     route: SessionProviderRoute,
@@ -55,6 +59,7 @@ export const prepareSessionExecution = (
     active,
     operation,
     parameters,
+    nativeSourceAdmitted,
     unboundOperationError,
     lookupSnapshot,
   } = input;
@@ -79,9 +84,12 @@ export const prepareSessionExecution = (
   const cacheable =
     profile !== undefined &&
     isSnapshotCacheable(operation, capability, parameters);
-  const cached = cacheable
-    ? lookupSnapshot(active.target, profile, operation, parameters)
-    : undefined;
+  const cached =
+    cacheable &&
+    (!requiresNativeSourceAdmissionBeforeReplay(capability.provider.id) ||
+      nativeSourceAdmitted)
+      ? lookupSnapshot(active.target, profile, operation, parameters)
+      : undefined;
   return ok({ active, capability, profile, cacheable, cached });
 };
 
@@ -126,6 +134,7 @@ export const bindExecutionTarget = (
       : { architecture: target.architecture }),
   };
   if (
+    result.value.subject !== undefined &&
     result.value.subject !== null &&
     result.value.subject.sha256 !== target.sha256 &&
     !isArtifactBundleSubject(operation, result.value.subject, target)
@@ -136,7 +145,9 @@ export const bindExecutionTarget = (
         `${operation}:subject`,
       ),
     );
-  return ok({ ...result.value, subject: result.value.subject ?? subject });
+  return result.value.subject === undefined
+    ? ok({ ...result.value, subject })
+    : result;
 };
 
 const isArtifactBundleSubject = (

@@ -1,29 +1,39 @@
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { Evidence } from "../evidence.js";
-import {
-  type ApplicationEdge,
-  type ApplicationNode,
+import type {
+  ApplicationEdge,
+  ApplicationNode,
 } from "./javascriptApplicationGraphSchemas.js";
+import type { JavaScriptApplicationGraph } from "./javascriptApplicationGraph.js";
 import type { ApplicationFeatureTraceResult } from "./javascriptFeatureTraceSchemas.js";
 
 type NativeHandoff = ApplicationFeatureTraceResult["native_handoffs"][number];
 
 /** Build provider-neutral addon targets and link exact-subject native Evidence. */
 export const buildJavaScriptNativeHandoffs = (
-  nodes: readonly ApplicationNode[],
-  edges: readonly ApplicationEdge[],
+  graph: JavaScriptApplicationGraph,
+  selectedNativeNodeIds: ReadonlySet<string>,
   nativeEvidence: readonly Evidence[],
 ): NativeHandoff[] => {
-  const nodeById = new Map(nodes.map((node) => [node.node_id, node]));
-  return nodes
-    .filter(({ kind }) => kind === "native-addon")
+  let nodeById: Map<string, ApplicationNode> | undefined;
+  return graph.nodes
+    .filter(
+      ({ kind, node_id }) =>
+        kind === "native-addon" && selectedNativeNodeIds.has(node_id),
+    )
     .flatMap((node) => {
-      const digest = artifactDigest(node);
-      if (digest === null) return [];
+      // Observations may describe only a containing archive. A native target
+      // requires the node owner's exact byte identity, independently of its
+      // path, availability labels or the artifact supporting an observation.
+      if (node.identity.strategy !== "content-digest") return [];
+      const digest = node.identity.sha256;
       const linked = nativeEvidence.filter(
         ({ subject }) => subject?.digest.sha256 === digest,
       );
-      const exportNodes = nativeExportNodes(node, edges, nodeById);
+      nodeById ??= new Map(
+        graph.nodes.map((candidate) => [candidate.node_id, candidate]),
+      );
+      const exportNodes = nativeExportNodes(node, graph.edges, nodeById);
       return [
         {
           native_node_id: node.node_id,
@@ -52,16 +62,6 @@ export const buildJavaScriptNativeHandoffs = (
     .sort((left, right) =>
       compareUnicodeCodePoints(left.native_node_id, right.native_node_id),
     );
-};
-
-const artifactDigest = (node: ApplicationNode): string | null => {
-  if (node.identity.strategy === "content-digest") return node.identity.sha256;
-  const observation = node.observations.find(
-    ({ evidence }) => evidence.artifact.available,
-  );
-  return observation?.evidence.artifact.available === true
-    ? observation.evidence.artifact.sha256
-    : null;
 };
 
 const artifactPath = (node: ApplicationNode): string | null => {
@@ -103,7 +103,12 @@ const nativeExportNodes = (
 const requestedExports = (nodes: readonly ApplicationNode[]): string[] => {
   const values = nodes.flatMap((node) =>
     node.observations.flatMap((observation) => [
-      ...(observation.label === null ? [] : [observation.label]),
+      // Display labels can summarize several names or namespace access.
+      // Only legacy observations without structured member facts need them.
+      ...(observation.label === null ||
+      Array.isArray(observation.properties.requested_members)
+        ? []
+        : [observation.label]),
       ...stringArray(observation.properties.requested_members),
       ...stringArray(observation.properties.members),
     ]),

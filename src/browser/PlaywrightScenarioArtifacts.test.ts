@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import type { BrowserContext, Page } from "playwright-core";
 
 import { browserScenarioSchema } from "../domain/browserScenario.js";
-import { BrowserScenarioSecrets } from "./BrowserScenarioSecrets.js";
+import { resolveScenarioSecrets } from "../../tests/fixtures/browserScenarioSecrets.js";
 import { capturePlaywrightStepArtifacts } from "./PlaywrightScenarioArtifacts.js";
 
 const scenario = browserScenarioSchema.parse({
@@ -13,9 +13,7 @@ const scenario = browserScenarioSchema.parse({
   start_url: { url: "https://app.example.test/" },
   actions: [{ step_id: "wait", action: "wait_for_timeout", duration_ms: 1 }],
 });
-const secrets = BrowserScenarioSecrets.resolve(scenario, {});
-if (secrets === undefined)
-  throw new Error("Expected resolved scenario secrets");
+const secrets = resolveScenarioSecrets(scenario, {});
 
 it("returns a complete requested text artifact beyond the former inline ceiling", async () => {
   const page = {
@@ -57,14 +55,9 @@ it("redacts declared secrets from current and historical URL artifacts", async (
     ],
     capture: { at_end: ["url", "history"] },
   });
-  const scenarioSecrets = BrowserScenarioSecrets.resolve(
-    scenarioWithSecretUrl,
-    {
-      REA_URL_TOKEN: secretValue,
-    },
-  );
-  if (scenarioSecrets === undefined)
-    throw new Error("Expected resolved URL secret");
+  const scenarioSecrets = resolveScenarioSecrets(scenarioWithSecretUrl, {
+    REA_URL_TOKEN: secretValue,
+  });
   const query = new URLSearchParams([["token", secretValue]]).toString();
   const url = `https://app.example.test/?${query}#${encodeURIComponent(secretValue)}`;
   const page = {
@@ -106,6 +99,62 @@ it("redacts declared secrets from current and historical URL artifacts", async (
             url: "https://app.example.test/?token=[REDACTED:url_token]#[REDACTED:url_token]",
           },
         },
+      ],
+    },
+  });
+});
+
+it("redacts a declared secret used as a cookie or storage name", async () => {
+  const secretValue = "session-token";
+  const scenarioWithSecret = browserScenarioSchema.parse({
+    browser: { mode: "launch", executable_path: "/opt/chromium" },
+    start_url: { url: "https://app.example.test/" },
+    actions: [{ step_id: "wait", action: "wait_for_timeout", duration_ms: 1 }],
+    secrets: [
+      { secret_id: "storage_key", environment_variable: "REA_STORAGE_KEY" },
+    ],
+  });
+  const scenarioSecrets = resolveScenarioSecrets(scenarioWithSecret, {
+    REA_STORAGE_KEY: secretValue,
+  });
+  const page = {
+    url: () => "https://app.example.test/",
+    evaluate: async () => ({
+      local_storage: [[secretValue, "kept-value"]],
+      session_storage: [["theme", secretValue]],
+    }),
+  } as unknown as Page;
+  const context = {
+    cookies: async () => [
+      {
+        name: secretValue,
+        value: "ordinary",
+        domain: "app.example.test",
+        path: "/",
+        secure: true,
+        httpOnly: false,
+        sameSite: "Lax" as const,
+      },
+    ],
+  } as unknown as BrowserContext;
+
+  const result = await capturePlaywrightStepArtifacts({
+    context,
+    page,
+    secrets: scenarioSecrets,
+    requested: new Set(["storage"]),
+  });
+
+  expect(JSON.stringify(result.storage)).not.toContain(secretValue);
+  expect(result.storage).toMatchObject({
+    state: "captured",
+    value: {
+      cookies: [{ name: "[REDACTED:storage_key]", value_state: "hashed" }],
+      local_storage: [
+        { name: "[REDACTED:storage_key]", value_state: "hashed" },
+      ],
+      session_storage: [
+        { name: "theme", value_state: "redacted-secret", value_sha256: null },
       ],
     },
   });

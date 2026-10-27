@@ -1,19 +1,86 @@
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 
-import type { AnalysisOperationPort } from "../../../src/application/AnalysisProvider.js";
+import {
+  createAnalysisExecution,
+  type AnalysisOperationPort,
+} from "../../../src/application/AnalysisProvider.js";
+import { FUNCTION_COMPARISON_EXAMPLE } from "../../../src/contracts/functionComparisonExample.js";
 import { AnalysisCancelledError } from "../../../src/domain/analysisErrorCore.js";
-import { err } from "../../../src/domain/result.js";
+import { err, ok } from "../../../src/domain/result.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { observed } from "../../fixtures/analysisExecution.js";
 
 describe("ordinary MCP progress and cancellation", () => {
-  it("emits bounded progress for a normal tool request", async () => {
+  it("advances MCP progress when provider waiting does not advance completed work", async () => {
     const analysis: AnalysisOperationPort = {
-      execute: () => Promise.resolve(observed("0x1000")),
+      execute: async (_operation, _parameters, options) => {
+        for (const message of ["import pending", "analysis pending"]) {
+          await delay(120);
+          await options?.progress?.report({
+            phase: "ghidra_startup",
+            completed: 0,
+            total: null,
+            message,
+          });
+        }
+        return observed("0x1000");
+      },
     };
     const server = createServer({ kind: "fixed", analysis });
     const client = new Client({ name: "progress-test", version: "1" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    const progress: {
+      progress: number;
+      total?: number | undefined;
+      message?: string | undefined;
+    }[] = [];
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const result = await client.callTool(
+        { name: "current_address", arguments: {} },
+        { onprogress: (update) => progress.push(update) },
+      );
+
+      expect(result.isError).not.toBe(true);
+      expect(progress[0]?.progress).toBe(1);
+      expect(progress.map((update) => update.message)).toEqual(
+        expect.arrayContaining([
+          "ghidra_startup: import pending",
+          "ghidra_startup: analysis pending",
+        ]),
+      );
+      expect(progress.at(-1)?.message).toContain("completed");
+      progress.forEach((update, index) => {
+        expect(update.progress).toBeGreaterThan(
+          progress[index - 1]?.progress ?? 0,
+        );
+        expect(update.total).toBeUndefined();
+      });
+    } finally {
+      await Promise.allSettled([client.close(), server.close()]);
+    }
+  });
+
+  it("keeps analyze_function progress strictly increasing from start to completion", async () => {
+    const analysis: AnalysisOperationPort = {
+      execute: (operation) =>
+        Promise.resolve(
+          ok(
+            createAnalysisExecution(
+              operation === "analyze_function"
+                ? FUNCTION_COMPARISON_EXAMPLE.left.normalized_result
+                : "0x1000",
+              { id: "fixture", name: "Fixture", version: "1" },
+            ),
+          ),
+        ),
+    };
+    const server = createServer({ kind: "fixed", analysis });
+    const client = new Client({ name: "function-progress-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
     const progress: number[] = [];
@@ -21,16 +88,17 @@ describe("ordinary MCP progress and cancellation", () => {
       await server.connect(serverTransport);
       await client.connect(clientTransport);
       const result = await client.callTool(
-        { name: "current_address", arguments: {} },
+        {
+          name: "analyze_function",
+          arguments: { procedure: "main", detail: "complete" },
+        },
         { onprogress: (update) => progress.push(update.progress) },
       );
 
       expect(result.isError).not.toBe(true);
-      expect(progress[0]).toBe(0);
-      expect(progress.at(-1)).toBe(1);
+      expect(progress.length).toBeGreaterThanOrEqual(2);
       progress.forEach((value, index) => {
-        expect(value).toBeGreaterThanOrEqual(progress[index - 1] ?? 0);
-        expect(value).toBeLessThanOrEqual(1);
+        expect(value).toBeGreaterThan(progress[index - 1] ?? 0);
       });
     } finally {
       await Promise.allSettled([client.close(), server.close()]);

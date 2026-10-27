@@ -2,10 +2,12 @@ import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
 import type { EvmInterfaceService } from "../application/evm/EvmInterfaceService.js";
 import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
-import { toolContract } from "../contracts/toolContracts.js";
+import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
+import { evmInterfaceModule } from "../composition/evm.js";
 import type { Logger } from "pino";
-import { logToolExecution } from "./toolLogging.js";
-import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
+import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
+import { createRetainedSummaryToolHandler } from "./contractToolHandler.js";
+import { applicationToolRegistrationOptions } from "./toolRegistrationOptions.js";
 
 /** Bind the named EVM contract to shared validation and session Evidence recording. */
 export const registerEvmTools = (
@@ -13,22 +15,21 @@ export const registerEvmTools = (
   service: EvmInterfaceService,
   logger: Logger,
   recordEvidence?: EvidenceWriter["recordEvidence"],
+  withAdmittedAnalysis?: WithAdmittedAnalysis,
+  evidenceById?: EvidenceLookup,
 ): void => {
-  const contract = toolContract("inspect_evm_interface");
+  const contract = evmInterfaceModule.contract;
+  const handler = createRetainedSummaryToolHandler(
+    server,
+    contract,
+    (input, options) => service.inspect(input, options),
+    logger,
+    { recordEvidence, evidenceById },
+    withAdmittedAnalysis,
+  );
   server.registerTool(
     contract.name,
-    toolRegistrationOptions(contract),
-    async (input, context) => {
-      const result = await logToolExecution(logger, contract.name, () =>
-        service.inspect(input, { signal: context.mcpReq.signal }),
-      );
-      if (!result.ok) return server.delivery.toCallToolResult(result, contract);
-      const recorded = recordEvidence?.(result.value);
-      return server.delivery.toEvidenceToolResult(
-        result.value,
-        contract,
-        recorded,
-      );
-    },
+    applicationToolRegistrationOptions(contract),
+    handler,
   );
 };

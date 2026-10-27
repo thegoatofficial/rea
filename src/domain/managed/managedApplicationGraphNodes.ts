@@ -7,10 +7,11 @@ import type { ApplicationGraphEvidence } from "../javascript/javascriptApplicati
 import type { ApplicationNode } from "../javascript/javascriptApplicationGraphSchemas.js";
 import { managedSourceCoverage } from "./managedApplicationGraphCoverage.js";
 import type { Evidence } from "../evidence.js";
-import {
-  type ManagedArtifactInspection,
-  type ManagedMemberInspection,
-  type ManagedNativeBoundaryInspection,
+import { managedTokenScopesMatch } from "./managedInspectionEvidence.js";
+import type {
+  ManagedArtifactInspection,
+  ManagedMemberInspection,
+  ManagedNativeBoundaryInspection,
 } from "./managedArtifact.js";
 import type {
   GraphBuildState,
@@ -22,6 +23,13 @@ type ManagedType = ManagedMemberInspection["types"][number];
 type PinvokeImport = ManagedNativeBoundaryInspection["pinvoke_imports"][number];
 type NativeImplementation =
   ManagedNativeBoundaryInspection["native_implementations"][number];
+
+/**
+ * Display label for a metadata name. Metadata may hold an empty name; the
+ * graph then has no label, while the node's properties keep the source value.
+ */
+const metadataLabel = (name: string): string | null =>
+  name === "" ? null : name;
 
 /** Options for a managed contains relationship edge. */
 export interface ContainsEdgeOptions {
@@ -76,7 +84,7 @@ export const addArtifactIdentityNodes = (
       ),
       observations: [
         {
-          label: assemblyFacts.name,
+          label: metadataLabel(assemblyFacts.name),
           properties: {
             name: assemblyFacts.name,
             version: assemblyFacts.version,
@@ -106,11 +114,11 @@ export const addArtifactIdentityNodes = (
       identity: artifactLocalIdentity(
         state.artifactSha256,
         "managed-module",
-        module.mvid ?? module.token,
+        module.mvid?.toLowerCase() ?? module.token,
       ),
       observations: [
         {
-          label: module.name,
+          label: metadataLabel(module.name),
           properties: {
             name: module.name,
             mvid: module.mvid,
@@ -138,25 +146,32 @@ interface ManagedModuleSource {
 const selectModuleSource = (
   parsed: ParsedManagedGraphInput,
 ): ManagedModuleSource | null => {
-  if (parsed.artifact?.result.module != null)
-    return {
-      module: parsed.artifact.result.module,
-      evidence: parsed.artifact.evidence,
-      coverageState: parsed.artifact.result.coverage.state,
-    };
-  if (parsed.members?.result.module != null)
-    return {
-      module: parsed.members.result.module,
-      evidence: parsed.members.evidence,
-      coverageState: parsed.members.result.coverage.state,
-    };
-  if (parsed.boundaries?.result.module != null)
-    return {
-      module: parsed.boundaries.result.module,
-      evidence: parsed.boundaries.evidence,
-      coverageState: parsed.boundaries.result.coverage.state,
-    };
-  return null;
+  const sources = [
+    parsed.artifact?.result.module == null
+      ? null
+      : {
+          module: parsed.artifact.result.module,
+          evidence: parsed.artifact.evidence,
+          coverageState: parsed.artifact.result.coverage.state,
+        },
+    parsed.members?.result.module == null
+      ? null
+      : {
+          module: parsed.members.result.module,
+          evidence: parsed.members.evidence,
+          coverageState: parsed.members.result.coverage.state,
+        },
+    parsed.boundaries?.result.module == null
+      ? null
+      : {
+          module: parsed.boundaries.result.module,
+          evidence: parsed.boundaries.evidence,
+          coverageState: parsed.boundaries.result.coverage.state,
+        },
+  ].filter((source): source is ManagedModuleSource => source !== null);
+  return (
+    sources.find(({ module }) => module.mvid !== null) ?? sources[0] ?? null
+  );
 };
 
 /** Add managed type, method, and field nodes from member evidence. */
@@ -229,7 +244,7 @@ const typeNode = (
     ),
     observations: [
       {
-        label: type.full_name,
+        label: metadataLabel(type.full_name),
         properties: {
           token: type.token,
           namespace: type.namespace,
@@ -258,10 +273,11 @@ const methodNode = (
     ),
     observations: [
       {
-        label:
+        label: metadataLabel(
           method.declaring_type === null
             ? method.name
             : `${method.declaring_type}.${method.name}`,
+        ),
         properties: {
           token: method.token,
           declaring_type_token: method.declaring_type_token,
@@ -294,10 +310,11 @@ const fieldNode = (
     ),
     observations: [
       {
-        label:
+        label: metadataLabel(
           field.declaring_type === null
             ? field.name
             : `${field.declaring_type}.${field.name}`,
+        ),
         properties: {
           token: field.token,
           declaring_type_token: field.declaring_type_token,
@@ -332,11 +349,17 @@ export const addBoundaryNodes = (
     boundaryInput.evidence,
     boundaries.coverage.state,
   );
+  const canJoinMemberTokens =
+    parsed.members !== null &&
+    managedTokenScopesMatch(
+      parsed.members.result.identity_scope.requires_mvid,
+      boundaries.identity_scope.requires_mvid,
+    );
   for (const pinvoke of pinvokes) {
     const node = pinvokeNode(state, pinvoke, sourceEvidence);
     state.nodes.push(node);
     const method =
-      pinvoke.member_token === null
+      pinvoke.member_token === null || !canJoinMemberTokens
         ? undefined
         : state.methodNodes.get(pinvoke.member_token);
     const memberEvidence =
@@ -370,7 +393,10 @@ export const addBoundaryNodes = (
       sourceEvidence,
     );
     state.nodes.push(node);
-    const owner = state.methodNodes.get(implementation.token) ?? artifactNode;
+    const owner =
+      (canJoinMemberTokens
+        ? state.methodNodes.get(implementation.token)
+        : undefined) ?? artifactNode;
     addContainsEdge(state, owner, node, {
       kind: "declares-managed-native-implementation",
       coverage: implementationCoverage,
@@ -393,7 +419,7 @@ const pinvokeNode = (
     ),
     observations: [
       {
-        label: pinvoke.import_name,
+        label: metadataLabel(pinvoke.import_name),
         properties: {
           token: pinvoke.token,
           member_token: pinvoke.member_token,
@@ -424,7 +450,7 @@ const nativeImplementationNode = (
     ),
     observations: [
       {
-        label: implementation.name,
+        label: metadataLabel(implementation.name),
         properties: {
           token: implementation.token,
           name: implementation.name,
@@ -476,7 +502,7 @@ const artifactLocalIdentity = (
 });
 
 /** Build managed static-analysis evidence for a graph observation. */
-const sourceManagedEvidence = (
+export const sourceManagedEvidence = (
   state: GraphBuildState,
   source: Evidence,
   coverageState: ManagedArtifactInspection["coverage"]["state"],

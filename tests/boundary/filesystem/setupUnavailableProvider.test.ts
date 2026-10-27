@@ -1,6 +1,6 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { createDoctorHostFixture } from "../../../src/application/Doctor.fixture.js";
 import { systemSetupHost } from "../../../src/application/SetupHost.js";
@@ -10,17 +10,9 @@ import { supportedClients } from "../../../src/application/SupportedClients.js";
 import { readClientRegistrationStatuses } from "../../../src/application/ClientRegistrationStatus.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
-const roots: string[] = [];
-afterEach(async () => {
-  await Promise.all(
-    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
-  );
-});
-
 describe("setup with configured but unavailable providers", () => {
   it("preserves Hopper settings and makes the second setup perform no writes", async () => {
     const root = await createTestTempDirectory("rea-setup-unavailable-");
-    roots.push(root);
     const client = supportedClients(root, "darwin", {}).find(
       (candidate) => candidate.name === "cursor",
     );
@@ -58,11 +50,11 @@ describe("setup with configured but unavailable providers", () => {
           },
         ]),
     });
-    const host = {
+    const createHost = () => ({
       ...systemSetupHost(doctor),
       detectedClients: () => Promise.resolve([client]),
       supportedClients: () => Promise.resolve([client]),
-    };
+    });
     const selected = {
       ...options(true),
       clientIds: ["cursor"],
@@ -71,7 +63,7 @@ describe("setup with configured but unavailable providers", () => {
       // This lane checks registration effects; no deep provider is required.
       readinessScope: { clients: [], providers: [], skill: false },
     };
-    const first = await runSetup(selected, host);
+    const first = await runSetup(selected, createHost());
     expect(first.status).toBe("ready");
     expect(first.clients.cursor).toMatchObject({ status: "configured" });
     const configured = await readFile(client.configPath, "utf8");
@@ -83,7 +75,7 @@ describe("setup with configured but unavailable providers", () => {
       readFile(`${client.configPath}.rea.backup`, "utf8"),
     ).resolves.toBe(original);
 
-    const second = await runSetup(selected, host);
+    const second = await runSetup(selected, createHost());
     expect(second.status).toBe("ready");
     expect(second.plannedActions).toEqual([]);
     expect(second.appliedActions).toEqual([]);

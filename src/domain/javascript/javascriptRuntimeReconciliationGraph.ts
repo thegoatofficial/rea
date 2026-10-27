@@ -1,6 +1,6 @@
 import {
   createJavaScriptApplicationGraph,
-  createJavaScriptApplicationNode,
+  mergeJavaScriptApplicationNodes,
   type JavaScriptApplicationGraph,
 } from "./javascriptApplicationGraph.js";
 import type {
@@ -39,7 +39,7 @@ export interface ReconciledApplicationGraphProjection {
 export const buildReconciledApplicationGraph = (
   input: ReconciledGraphInput,
 ): ReconciledApplicationGraphProjection => {
-  const merged = mergeNodes([
+  const merged = mergeJavaScriptApplicationNodes([
     ...input.layers.flatMap(({ graph }) => graph.nodes),
     ...input.runtime.nodes,
   ]);
@@ -209,42 +209,6 @@ const graphCoverage = (
           omitted_count: facts.omissionsKnown ? facts.knownOmissions : null,
           limits: [],
         };
-
-const mergeNodes = (nodes: readonly ApplicationNode[]): ApplicationNode[] => {
-  const grouped = new Map<string, ApplicationNode[]>();
-  for (const node of nodes)
-    grouped.set(node.node_id, [...(grouped.get(node.node_id) ?? []), node]);
-  const merged = [...grouped.values()].map((group) => {
-    const first = group[0];
-    if (first === undefined) throw new TypeError("Empty JAG node group");
-    if (
-      group.some(
-        ({ kind, identity }) =>
-          kind !== first.kind ||
-          JSON.stringify(identity) !== JSON.stringify(first.identity),
-      )
-    )
-      throw new TypeError("Colliding JAG node identifiers disagree");
-    const observations = [
-      ...new Map(
-        group
-          .flatMap(({ observations: values }) => values)
-          .map((observation) => [observation.observation_id, observation]),
-      ).values(),
-    ].sort((left, right) =>
-      compareUnicodeCodePoints(left.observation_id, right.observation_id),
-    );
-    return createJavaScriptApplicationNode({
-      kind: first.kind,
-      identity: first.identity,
-      observations: observations.map(
-        ({ observation_id: _id, identifier_strategy: _strategy, ...value }) =>
-          value,
-      ),
-    });
-  });
-  return merged;
-};
 
 const uniqueEdges = (edges: readonly ApplicationEdge[]): ApplicationEdge[] => [
   ...new Map(edges.map((edge) => [edge.edge_id, edge])).values(),

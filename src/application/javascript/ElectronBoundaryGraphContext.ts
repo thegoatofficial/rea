@@ -2,9 +2,10 @@ import type { ApplicationNode } from "../../domain/javascript/javascriptApplicat
 import { sha256Text } from "../../domain/javascript/javascriptStaticAnalysisHelpers.js";
 import type { JavaScriptSourceRange } from "../../domain/javascript/javascriptStaticAnalysisTypes.js";
 import type { JavaScriptArtifactFile } from "../../domain/javascript/javascriptArtifactFiles.js";
-import type {
-  JavaScriptArtifactGraphContext,
-  JavaScriptArtifactGraphCoverage,
+import {
+  sourceNodeFor,
+  type JavaScriptArtifactGraphContext,
+  type JavaScriptArtifactGraphCoverage,
 } from "./JavaScriptArtifactGraphContext.js";
 import {
   astObservationEvidence,
@@ -26,6 +27,7 @@ export interface ElectronGraphEdgeInput {
     | "exposes"
     | "sends"
     | "invokes"
+    | "calls"
     | "handles";
   readonly operation: string;
   readonly properties: Readonly<Record<string, unknown>>;
@@ -38,10 +40,11 @@ export const electronFindingSourceNode = (
   context: JavaScriptArtifactGraphContext,
   file: JavaScriptArtifactFile,
   moduleKey: string | null,
+  runtime?: string,
 ): ApplicationNode | undefined =>
   moduleKey === null
     ? (context.assetNodes.get(file.path) ?? context.fileNodes.get(file.path))
-    : context.moduleNodes.get(`${file.path}\0${moduleKey}`);
+    : sourceNodeFor(context, file.path, moduleKey, runtime);
 
 /** Observation-scoped identity shared safely across different artifact files. */
 export const electronObservationIdentity = (
@@ -105,23 +108,3 @@ export const addElectronInferenceEdge = (
     }),
   });
 };
-
-/** Deterministic source-range key for artifact-local graph identities. */
-export const electronRangeKey = (range: JavaScriptSourceRange): string =>
-  `${String(range.start.line)}:${String(range.start.column)}-${String(range.end.line)}:${String(range.end.column)}`;
-
-/** Test exact source-range containment without assuming runtime reachability. */
-export const electronRangeContains = (
-  outer: JavaScriptSourceRange,
-  inner: JavaScriptSourceRange,
-): boolean =>
-  comparePoint(outer.start, inner.start) <= 0 &&
-  comparePoint(outer.end, inner.end) >= 0;
-
-const comparePoint = (
-  left: JavaScriptSourceRange["start"],
-  right: JavaScriptSourceRange["start"],
-): number =>
-  left.line === right.line
-    ? left.column - right.column
-    : left.line - right.line;

@@ -4,12 +4,10 @@ import { join } from "node:path";
 
 import { expect, it } from "vitest";
 
-import {
-  importReferenceSource,
-  normalizeHistoricalSourceParseFailures,
-} from "../../../src/application/ReferenceSourceImport.js";
+import { normalizeHistoricalSourceParseFailures } from "../../../src/application/ReferenceSourceImport.js";
 import { historicalSourceGraphSchema } from "../../../src/domain/referenceSourceGraph.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { importReferenceSource } from "../../support/referenceSourceResourceScope.js";
 
 const sources = {
   "fatal.js": 'import "./valid";\nconst = ;',
@@ -128,13 +126,6 @@ it("preserves recovered diagnostics and file evidence through filesystem import"
       to: "<dynamic-import>",
       kind: "imports",
       resolution: "unknown",
-      parse_state: "partial",
-    },
-    {
-      from_path: "src/recovered.js",
-      to: "node:fs",
-      kind: "requires",
-      resolution: "external",
       parse_state: "partial",
     },
     {

@@ -11,13 +11,36 @@ export const analysisInputErrorFromIssues = (
   input: unknown,
   options: {
     readonly cause?: unknown;
+    readonly userMessage?: string;
     readonly additionalIssues?: readonly AnalysisInputIssue[];
   } = {},
 ): AnalysisInputError =>
   new AnalysisInputError(
     operation,
-    options.cause === undefined ? undefined : { cause: options.cause },
+    {
+      ...(options.cause === undefined ? {} : { cause: options.cause }),
+      ...(options.userMessage === undefined
+        ? {}
+        : { userMessage: options.userMessage }),
+    },
     [...projectInputIssues(issues, input), ...(options.additionalIssues ?? [])],
+  );
+
+/** Remove only the internal operation/input envelope from caller correction paths. */
+export const analysisOperationInputErrorFromIssues = (
+  operation: string,
+  issues: readonly z.core.$ZodIssue[],
+  input: unknown,
+  cause: unknown,
+): AnalysisInputError =>
+  new AnalysisInputError(
+    operation,
+    { cause },
+    projectInputIssues(issues, { operation, input }).map((issue) =>
+      issue.path[0] === "input"
+        ? { ...issue, path: issue.path.slice(1) }
+        : issue,
+    ),
   );
 
 /** Project Zod failures to secret-safe caller correction metadata. */
@@ -35,7 +58,23 @@ const projectIssue = (
     typeof part === "string" || typeof part === "number" ? [part] : [],
   );
   // Branch issue paths are relative to the union; branches often agree.
-  if (issue.code === "invalid_union")
+  if (issue.code === "invalid_union") {
+    // Unmatched discriminators and ambiguous unions have no branch issues.
+    // Keep their outer failure instead of flattening it into an empty list.
+    if (issue.errors.length === 0) {
+      const expected =
+        "options" in issue ? issue.options?.filter(isSafeExpected) : undefined;
+      return [
+        {
+          path,
+          reason:
+            valueAtPath(input, path) === undefined
+              ? "missing_argument"
+              : "invalid_value",
+          ...(expected === undefined ? {} : { expected }),
+        },
+      ];
+    }
     return uniqueIssues(
       issue.errors.flatMap((branch) =>
         branch.flatMap((branchIssue) =>
@@ -46,6 +85,7 @@ const projectIssue = (
         ),
       ),
     );
+  }
   if (issue.code === "invalid_key")
     return issue.issues.flatMap((keyIssue) =>
       projectIssue(

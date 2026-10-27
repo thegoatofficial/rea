@@ -11,6 +11,7 @@ import {
 } from "../../../src/domain/browserObservationSchemas.js";
 import { parseEvidence } from "../../../src/domain/evidence.js";
 import { webCaptureDiffSchema } from "../../../src/domain/webCaptureDiffSchemas.js";
+import { passiveNetworkCapture } from "../../fixtures/passiveNetworkCapture.js";
 
 const ORIGIN = "https://example.test";
 const CAPTURE_TIME = "2026-01-01T00:00:00.000Z";
@@ -39,9 +40,81 @@ const equivalentBodies = [
   },
 ];
 
+it("captures all repeated array rows and empty arrays without retaining payload values", async () => {
+  const count = 6_000;
+  const body = JSON.stringify(
+    Array.from({ length: count }, (_, index) => ({
+      value: index % 2 === 0 ? index : "payload-value-excluded",
+      nested: index % 2 === 0 ? [] : [true, null],
+      empty: [],
+      "*": { "": "payload-value-excluded" },
+    })),
+  );
+  const before = captureBody("base64 response", body);
+  const shape = before.network.requests[0]?.body_shapes.response;
+  const element = { kind: "array-element" };
+  const property = (name: string) => ({ kind: "property", name });
+  expect(shape).toMatchObject({
+    root_type: "array",
+    node_count: count * 7 + 1,
+    max_depth_observed: 3,
+    properties: [
+      { path: [element], types: ["object"], observations: count },
+      {
+        path: [element, property("*")],
+        types: ["object"],
+        observations: count,
+      },
+      {
+        path: [element, property("*"), property("")],
+        types: ["string"],
+        observations: count,
+      },
+      {
+        path: [element, property("empty")],
+        types: ["array"],
+        observations: count,
+      },
+      {
+        path: [element, property("nested")],
+        types: ["array"],
+        observations: count,
+      },
+      {
+        path: [element, property("nested"), element],
+        types: ["boolean", "null"],
+        observations: count,
+      },
+      {
+        path: [element, property("value")],
+        types: ["number", "string"],
+        observations: count,
+      },
+    ],
+  });
+  expect(JSON.stringify(shape)).not.toContain("payload-value-excluded");
+  const after = captureBody("base64 response", body);
+  expect(
+    (await compareCaptures(before, after)).dimensions.network,
+  ).toMatchObject({
+    status: "unknown",
+    total_changes: 0,
+  });
+});
+
 describe.each<BodySource>(["request", "response", "base64 response"])(
   "CDP %s JSON shape comparison",
   (source) => {
+    it("keeps differing retained shapes unknown when both request inventories are attach-limited", async () => {
+      const [before, after] = comparableCaptures(source, "[123]", '["a"]');
+      expect(
+        (await compareCaptures(before, after)).dimensions.network,
+      ).toMatchObject({
+        status: "unknown",
+        total_changes: 0,
+      });
+    });
+
     it.each(equivalentBodies)(
       "does not report a network modification for reordered $name",
       async ({ before: beforeBody, after: afterBody }) => {
@@ -82,7 +155,16 @@ describe.each<BodySource>(["request", "response", "base64 response"])(
         before + " ".repeat(length - Buffer.byteLength(before)),
         after + " ".repeat(length - Buffer.byteLength(after)),
       );
-      const result = await compareCaptures(...captures);
+      expect(
+        (await compareCaptures(...captures)).dimensions.network,
+      ).toMatchObject({
+        status: "unknown",
+        total_changes: 0,
+      });
+      const result = await compareCaptures(
+        completeNormalizedCapture(captures[0]),
+        completeNormalizedCapture(captures[1]),
+      );
       expect(result.dimensions.network).toMatchObject({
         status: "changed",
         total_changes: 1,
@@ -105,7 +187,16 @@ describe.each<BodySource>(["request", "response", "base64 response"])(
           Buffer.byteLength(beforeBody) - Buffer.byteLength(changedBody),
         );
       const [before, after] = comparableCaptures(source, beforeBody, afterBody);
-      const result = await compareCaptures(before, after);
+      expect(
+        (await compareCaptures(before, after)).dimensions.network,
+      ).toMatchObject({
+        status: "unknown",
+        total_changes: 0,
+      });
+      const result = await compareCaptures(
+        completeNormalizedCapture(before),
+        completeNormalizedCapture(after),
+      );
 
       expect(result.overall_status).toBe("changed");
       expect(result.dimensions.network).toEqual({
@@ -150,6 +241,84 @@ describe("selected JSON body-shape coverage", () => {
       ).toBe("changed");
     },
   );
+
+  it.each([
+    {
+      name: "an omitted JSON body",
+      request: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        hasPostData: true,
+      },
+    },
+    {
+      name: "an unparseable JSON body",
+      request: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        postData: "{",
+      },
+    },
+  ])(
+    "keeps $name partial after a response shape arrives",
+    async ({ request }) => {
+      const before = captureBody("response", "[123]", request);
+      const after = captureBody("response", "[123]", request);
+      for (const capture of [before, after]) {
+        capture.completeness.attach_limited_sections = [];
+        expect(capture.completeness.unavailable_sections).toContain(
+          "json_body_shapes",
+        );
+        expect(capture.network.requests[0]?.body_shapes).toMatchObject({
+          status: "partial",
+          request: null,
+          response: { root_type: "array" },
+        });
+      }
+      expect(
+        (await compareCaptures(before, after)).dimensions.network,
+      ).toMatchObject({ status: "unknown", total_changes: 0 });
+    },
+  );
+
+  it.each([
+    { name: "a bodiless GET", request: { method: "GET", headers: {} } },
+    {
+      name: "a bodiless JSON-typed GET",
+      request: {
+        method: "GET",
+        headers: { "Content-Type": "application/json" },
+      },
+    },
+    {
+      name: "an omitted body without a media type",
+      request: { method: "POST", headers: {}, hasPostData: true },
+    },
+    {
+      name: "an omitted form body",
+      request: {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        hasPostData: true,
+      },
+    },
+  ])("includes the response shape for $name", async ({ request }) => {
+    const before = captureBody("response", "[123]", request);
+    const after = captureBody("response", "[123]", request);
+    for (const capture of [before, after]) {
+      capture.completeness.attach_limited_sections = [];
+      expect(capture.completeness.unavailable_sections).not.toContain(
+        "json_body_shapes",
+      );
+      expect(capture.network.requests[0]?.body_shapes).toMatchObject({
+        status: "included",
+        request: null,
+      });
+    }
+    expect(
+      (await compareCaptures(before, after)).dimensions.network,
+    ).toMatchObject({ status: "unchanged", total_changes: 0 });
+  });
 
   it("ignores shapes when either capture did not request them", async () => {
     const before = captureBody("request", "[123]");
@@ -231,7 +400,25 @@ const compareCaptures = async (
   return webCaptureDiffSchema.parse(evidence.normalized_result);
 };
 
-const captureBody = (source: BodySource, body: string): WebPageInspection => {
+/** Authored complete comparison inventories reuse parsed request facts, not live CDP coverage. */
+const completeNormalizedCapture = (
+  source: WebPageInspection,
+): WebPageInspection => {
+  const normalized = passiveNetworkCapture([]);
+  normalized.target = source.target;
+  normalized.network = source.network;
+  return normalized;
+};
+
+const captureBody = (
+  source: BodySource,
+  body: string,
+  request: Record<string, unknown> = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    postData: source === "request" ? body : "{}",
+  },
+): WebPageInspection => {
   const events = new CdpCaptureEvents(
     inspectWebPageInputSchema.parse({
       cdp_endpoint: "http://127.0.0.1:9222",
@@ -248,12 +435,8 @@ const captureBody = (source: BodySource, body: string): WebPageInspection => {
     params: {
       requestId: "request-1",
       type: "Fetch",
-      request: {
-        url: `${ORIGIN}/api`,
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        postData: source === "request" ? body : "{}",
-      },
+      request: { url: `${ORIGIN}/api`, ...request },
+      initiator: { type: "script" },
     },
   });
   const responseBody = source === "request" ? "{}" : body;
@@ -276,8 +459,10 @@ const captureBody = (source: BodySource, body: string): WebPageInspection => {
       encodedDataLength: Buffer.byteLength(responseBody),
     },
   });
-  expect(events.responseBodyRequestIds()).toEqual(["request-1"]);
-  events.ingestResponseBody("request-1", {
+  const candidate = events.responseBodyRequests()[0];
+  expect(candidate?.requestId).toBe("request-1");
+  expect(candidate).toBeDefined();
+  events.ingestResponseBody(candidate!, {
     body:
       source === "base64 response"
         ? Buffer.from(responseBody).toString("base64")
@@ -323,7 +508,7 @@ const captureBody = (source: BodySource, body: string): WebPageInspection => {
     resources: [],
     network: {
       requests: [...events.network.values()],
-      websocket_events: events.websockets,
+      websocket_connections: [...events.webSocketConnectionsById.values()],
       coverage_started_at: CAPTURE_TIME,
       prior_activity_available: false,
     },

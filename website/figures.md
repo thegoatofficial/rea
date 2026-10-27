@@ -52,11 +52,24 @@ preparation. Check the rendered image for readable text and spacing before
 publishing. The build uses DejaVu Sans for consistent typography; only the SVG
 source is committed. Metadata and build instructions are in the website README.
 
+The card and `public/assets/favicon.svg` each carry a dark
+`prefers-color-scheme` block for people who open the SVG directly or use a dark
+browser tab strip. CairoSVG ignores it, so the PNG that link previews fetch
+stays light.
+
+## README showcases
+
+`docs/assets/rea-showcases.svg` and `docs/assets/rea-showcases-dark.svg` redraw
+the three showcase illustrations as flat SVG, one file per colour scheme. Every
+README edition picks one with a `<picture>` element and a
+`prefers-color-scheme: dark` source, as the star-history chart does. Keep the
+two files the same shape when you change one.
+
 ## Beginner homepage and dinosaur reconstruction
 
 The manual/agent comparison and Calculator percentage controls are semantic
-HTML. Calculator’s assembly comes from a real installed model DLL; the named
-calculation is a readable summary crosschecked against Microsoft’s public source. See
+HTML. Calculator's assembly comes from a real installed model DLL; the named
+calculation is a readable summary crosschecked against Microsoft's public source. See
 [evidence/calculator-and-dino.md](evidence/calculator-and-dino.md).
 
 The introduction pairs selected Calculator instructions with three selectable
@@ -64,14 +77,14 @@ analyst thoughts: decode operator branches, trace arithmetic calls, then name
 the percentage rule. The small analyst illustration is authored SVG; the
 thought bubbles, findings and labels are selectable HTML. The thoughts
 illustrate the analysis rather than reproduce a recorded conversation. The
-agent side asks the same question and separates REA’s evidence from the
-agent’s explanation. Keep those roles and the instruction highlights aligned
+agent side asks the same question and separates REA's evidence from the
+agent's explanation. Keep those roles and the instruction highlights aligned
 when changing a step.
 
 The homepage explains reverse engineering before the worked examples. Each
 example opens with its goal and reason for inspecting the program. A selected
 highlight marks the intended result; the “REA returned” block identifies the
-evidence. The flows label REA’s inspection and the agent’s interpretation or
+evidence. The flows label REA's inspection and the agent's interpretation or
 reconstruction explicitly. Preserve this context when moving a demo.
 
 The dinosaur sequence uses an HTML flow: inspect the loaded script, rebuild the
@@ -93,6 +106,30 @@ APK's selected Java and an explanatory summary.
 [evidence/aegis-login-code.md](evidence/aegis-login-code.md) records the inspected
 APK, methods, source attribution and reconstruction checks. Keep the block
 formula, default settings, slider outputs and reference cases consistent.
+
+## Touhou reconstruction essay
+
+The essay opens with a takeaway and a flywheel explaining how experience
+compounds. The figure uses selectable HTML labels and inline SVG connectors:
+an autonomous agent proposes an experiment, an oracle tests it against a
+reference, and code, evidence, checks and lessons remain in the repository.
+A dashed mismatch branch returns to the agent for revision. The repository
+supplies a better starting point for the next investigation; TH08 → TH095 →
+TH04 illustrates knowledge carried between projects. Human direction names
+the goal and acceptance criteria above the cycle.
+
+The caption connects reuse with improving the checks themselves. The TH08
+floating-literal case in the essay explains why a passing result can need
+reexamination when an oracle's blind spot is discovered. Preserve that link
+between the figure's ideal loop and the infrastructure lessons in the prose.
+
+The shared stylesheet positions the labels and gives narrow screens separate
+connector geometry. Keep the arrows clear of the text and retain the same
+meaning at every width. This is an explanatory model, with no measured speed
+or productivity multiplier. Project dates and the attributed README excerpt
+support the narrative; detailed milestone references are available in a native
+disclosure. Their provenance is documented in
+[evidence/touhou-reconstruction-method.md](evidence/touhou-reconstruction-method.md).
 
 ## Original image generation prompts
 

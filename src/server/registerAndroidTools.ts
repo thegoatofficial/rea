@@ -1,13 +1,16 @@
 import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
-import type { ServerContext } from "@modelcontextprotocol/server";
 import { AndroidAnalysisService } from "../application/android/AndroidAnalysisService.js";
+import { inspectAndroidPackage } from "../application/android/AndroidPackageInspection.js";
+import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
 import { toolContract } from "../contracts/toolContracts.js";
-import type { ToolContract } from "../contracts/toolContractTypes.js";
-import type { AndroidOperation } from "../domain/android/androidAnalysis.js";
 import type { Logger } from "pino";
-import { logToolExecution } from "./toolLogging.js";
+import {
+  createContractToolHandler,
+  type ContractToolService,
+} from "./contractToolHandler.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
+import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
 
 /** Bind Android handlers to their exact named contracts through shared workflows. */
 export const registerAndroidTools = (
@@ -15,27 +18,37 @@ export const registerAndroidTools = (
   service: AndroidAnalysisService,
   logger: Logger,
   recordEvidence?: EvidenceWriter["recordEvidence"],
+  withAdmittedAnalysis?: WithAdmittedAnalysis,
+  evidenceById?: EvidenceLookup,
 ): void => {
-  const handler = (contract: ToolContract<AndroidOperation>) => {
-    const name = contract.name;
-    return async (input: unknown, context: ServerContext) => {
-      const result = await logToolExecution(logger, name, () =>
-        service.execute(name, input, { signal: context.mcpReq.signal }),
-      );
-      if (!result.ok) return server.delivery.toCallToolResult(result, contract);
-      const recorded = recordEvidence?.(result.value);
-      return server.delivery.toEvidenceToolResult(
-        result.value,
-        contract,
-        recorded,
-      );
-    };
-  };
+  const handler = createContractToolHandler(
+    server,
+    service,
+    logger,
+    recordEvidence,
+    withAdmittedAnalysis,
+  );
   const packageContract = toolContract("inspect_android_package");
+  const packageService: ContractToolService<"inspect_android_package"> = {
+    execute: (_operation, input, options) =>
+      inspectAndroidPackage(
+        service,
+        input,
+        { recordEvidence, evidenceById },
+        options,
+      ),
+  };
+  const packageHandler = createContractToolHandler(
+    server,
+    packageService,
+    logger,
+    recordEvidence,
+    withAdmittedAnalysis,
+  );
   server.registerTool(
     packageContract.name,
     toolRegistrationOptions(packageContract),
-    handler(packageContract),
+    packageHandler(packageContract),
   );
   const searchContract = toolContract("search_android_classes");
   server.registerTool(

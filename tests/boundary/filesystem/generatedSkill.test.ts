@@ -21,7 +21,7 @@ async function fixture(eol = "\n") {
     await mkdir(dirname(join(root, path)), { recursive: true });
     await copyFile(join(repositoryRoot, path), join(root, path));
   }
-  const sourceRoot = join(root, "skill-src/reverse-engineer-anything");
+  const sourceRoot = join(root, ".agents/skills/reverse-engineer-anything");
   const outputRoot = join(root, "skills/reverse-engineer-anything");
   await mkdir(join(sourceRoot, "references"), { recursive: true });
   await mkdir(join(root, "dist"));
@@ -38,7 +38,7 @@ async function fixture(eol = "\n") {
   const identity = async (count: number, digest: string) =>
     writeFile(
       join(root, "dist/catalogIdentity.js"),
-      `export const CATALOG_IDENTITY = ${JSON.stringify({ counts: { mcp_tools: count }, digests: { combined_sha256: digest } })};\n`,
+      `export const FULL_CATALOG_IDENTITY = ${JSON.stringify({ counts: { mcp_tools: count }, digests: { combined_sha256: digest } })};\n`,
     );
   await identity(139, "a".repeat(64));
   const generate = (...args: string[]) =>

@@ -4,9 +4,30 @@ import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { ElectronStaticValue } from "./electronStaticAnalysisTypes.js";
 import {
   readExactJavaScriptLiteral,
+  semanticStaticPropertyKey,
   semanticStaticPropertyName,
 } from "./javascriptAstValues.js";
 import { sourceSlice } from "./javascriptStaticAnalysisHelpers.js";
+import type { JavaScriptFindingContext } from "./javascriptStaticAnalysisState.js";
+
+/** Resolve a callee only when its root has a proven Electron module identity. */
+export const electronCalleePath = (
+  callee: t.Node,
+  context: JavaScriptFindingContext,
+): readonly string[] | undefined => {
+  const members: string[] = [];
+  let root = callee;
+  while (t.isMemberExpression(root) || t.isOptionalMemberExpression(root)) {
+    const member = semanticStaticPropertyName(root.property, root.computed);
+    if (member === "" || !t.isNode(root.object)) return undefined;
+    members.push(member);
+    root = root.object;
+  }
+  const exported = context.electronBindings?.get(root.start ?? -1);
+  return exported === undefined
+    ? undefined
+    : [...exported, ...members.toReversed()];
+};
 
 /** Preserve one literal value or the exact inert expression. */
 export const electronStaticValue = (
@@ -31,28 +52,6 @@ export const boundedExpression = (
   if (node === null || node === undefined) return "[missing-expression]";
   const expression = sourceSlice(source, node).trim();
   return expression === "" ? `[${node.type}]` : expression;
-};
-
-/** Find the effective explicit property, preserving unresolved overrides. */
-export const objectProperty = (
-  object: t.Node | undefined,
-  name: string,
-):
-  | { readonly status: "missing" | "dynamic" }
-  | { readonly status: "explicit"; readonly property: t.ObjectProperty } => {
-  if (object === undefined) return { status: "missing" };
-  if (!t.isObjectExpression(object)) return { status: "dynamic" };
-  for (const property of object.properties.toReversed()) {
-    if (t.isSpreadElement(property)) return { status: "dynamic" };
-    const key = semanticStaticPropertyName(property.key, property.computed);
-    if (key === "" && !t.isStringLiteral(property.key))
-      return { status: "dynamic" };
-    if (key !== name) continue;
-    return t.isObjectProperty(property)
-      ? { status: "explicit", property }
-      : { status: "dynamic" };
-  }
-  return { status: "missing" };
 };
 
 type PresentHandlerKind =
@@ -80,6 +79,12 @@ export function handlerKind(
   return "dynamic-expression";
 }
 
+/**
+ * Nesting bound for dotted contextBridge member paths. Deeper objects count as
+ * one unknown member rather than being enumerated.
+ */
+export const contextBridgeMemberPathDepth = 8;
+
 /** Collect statically visible dotted keys from one literal contextBridge API object. */
 export const collectContextBridgeMembers = (
   node: t.Node | null | undefined,
@@ -104,7 +109,7 @@ export const collectContextBridgeMembers = (
     members: [],
     unknown: 0,
   };
-  collectMembersAt(node, "", 0, state);
+  collectMembersAt(node, [], state);
   const members = [...new Set(state.members)].sort(compareUnicodeCodePoints);
   return {
     status: "object-literal",
@@ -115,11 +120,10 @@ export const collectContextBridgeMembers = (
 
 const collectMembersAt = (
   object: t.ObjectExpression,
-  prefix: string,
-  depth: number,
+  prefix: readonly string[],
   state: { members: string[]; unknown: number },
 ): void => {
-  if (depth >= 8) {
+  if (prefix.length >= contextBridgeMemberPathDepth) {
     state.unknown += 1;
     return;
   }
@@ -128,15 +132,23 @@ const collectMembersAt = (
       state.unknown += 1;
       continue;
     }
-    const name = semanticStaticPropertyName(property.key, property.computed);
-    if (name === "" || property.computed) {
+    const name = semanticStaticPropertyKey(property.key, property.computed);
+    if (name === null) {
       state.unknown += 1;
       continue;
     }
-    const path = prefix === "" ? name : `${prefix}.${name}`;
+    if (
+      t.isObjectProperty(property) &&
+      !property.computed &&
+      !property.shorthand &&
+      name === "__proto__"
+    )
+      continue;
+    const segments = [...prefix, name];
+    const path = segments.join(".");
     state.members.push(path);
     if (t.isObjectProperty(property) && t.isObjectExpression(property.value))
-      collectMembersAt(property.value, path, depth + 1, state);
+      collectMembersAt(property.value, segments, state);
   }
 };
 

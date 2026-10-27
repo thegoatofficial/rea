@@ -1,34 +1,34 @@
-import { requireMcpToolError } from "./lib/mcp-verifier-results.mjs";
+import {
+  requireMcpLifecycleResult,
+  requireMcpToolError,
+} from "./lib/mcp-verifier-results.mjs";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { readFile, rm } from "node:fs/promises";
 
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
-import { MCP_STARTUP_POLICY } from "../dist/mcpStartupPolicy.js";
+import { resolveMcpStartupBudgets } from "../dist/config/mcpStartupBudgets.js";
 import { parseEvidence } from "../dist/domain/evidence.js";
 import * as prompts from "./verify-package-prompts.mjs";
-import { json, verifyCompleteToolCatalog } from "./lib/verify-package-core.mjs";
-
-const execute = promisify(execFile);
+import { verifyCompleteToolCatalog } from "./lib/verify-package-core.mjs";
+import { withVerifierCleanup } from "./lib/verifier-cleanup.mjs";
 
 const verifyMcpToolsAndPrompts = async (client, mcpOptions) => {
   await verifyCompleteToolCatalog(client, mcpOptions);
   await prompts.verifyPromptCatalog(client, mcpOptions, prompts.names);
-  await prompts.verifyPromptCompletion(client, mcpOptions, false);
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
 };
 
 const verifyMcpTargetFree = async (client, mcpOptions) => {
-  const status = await client.callTool(
+  const result = await client.callTool(
     { name: "binary_session", arguments: {} },
     mcpOptions,
   );
-  const currentDocument =
-    status.structuredContent?.result?.tool_availability?.find(
-      ({ name }) => name === "current_document",
-    );
+  const status = requireMcpLifecycleResult(result, "binary_session");
+  const currentDocument = status.tool_availability.find(
+    ({ name }) => name === "current_document",
+  );
   if (
     currentDocument?.available !== false ||
     currentDocument.reason !== "target_required"
@@ -67,15 +67,13 @@ const verifyMcpOpenAndBind = async (client, mcpOptions) => {
   );
   if (opened.isError === true)
     throw new Error("packaged MCP could not open a binary");
-  const providerStatusEnvelope = json(
-    prompts.mcpText(
-      await client.callTool(
-        { name: "binary_session", arguments: {} },
-        mcpOptions,
-      ),
+  const providerStatus = requireMcpLifecycleResult(
+    await client.callTool(
+      { name: "binary_session", arguments: {} },
+      mcpOptions,
     ),
+    "binary_session",
   );
-  const providerStatus = providerStatusEnvelope.result;
   if (
     providerStatus.analysis_provider_binding?.provider?.id !== "hopper" ||
     providerStatus.analysis_provider_binding?.selection_source !== "request"
@@ -97,7 +95,7 @@ const verifyMcpNonLinuxCurrentDocument = async (
   mcpOptions,
   current,
 ) => {
-  if (json(prompts.mcpText(current)).normalized_result !== "fixture")
+  if (JSON.parse(prompts.mcpText(current)).normalized_result !== "fixture")
     throw new Error("packaged MCP bridge call failed");
   const batch = await client.callTool(
     {
@@ -106,7 +104,7 @@ const verifyMcpNonLinuxCurrentDocument = async (
     },
     mcpOptions,
   );
-  const batchResult = json(prompts.mcpText(batch)).normalized_result;
+  const batchResult = JSON.parse(prompts.mcpText(batch)).normalized_result;
   if (
     batch.isError === true ||
     batchResult?.total !== 1 ||
@@ -120,11 +118,8 @@ const verifyMcpNonLinuxCurrentDocument = async (
 
 const verifyMcpBinaryLifecycle = async (client, mcpOptions) => {
   await verifyMcpOpenAndBind(client, mcpOptions);
-  await prompts.verifyPromptCompletion(
-    client,
-    mcpOptions,
-    process.platform !== "linux",
-  );
+  // Completion never starts a provider; only an ordinary operation readies it.
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
   if (process.platform === "linux") {
     await verifyMcpLinuxToolAvailability(client, mcpOptions);
   } else {
@@ -133,6 +128,7 @@ const verifyMcpBinaryLifecycle = async (client, mcpOptions) => {
       mcpOptions,
     );
     await verifyMcpNonLinuxCurrentDocument(client, mcpOptions, current);
+    await prompts.verifyPromptCompletion(client, mcpOptions, ["fixture"]);
   }
   const closed = await client.callTool(
     { name: "close_binary", arguments: {} },
@@ -140,7 +136,7 @@ const verifyMcpBinaryLifecycle = async (client, mcpOptions) => {
   );
   if (closed.isError === true)
     throw new Error("packaged MCP could not close its binary");
-  await prompts.verifyPromptCompletion(client, mcpOptions, false);
+  await prompts.verifyPromptCompletion(client, mcpOptions, []);
 };
 
 const verifyMcpEvidenceBundle = async (client, mcpOptions, evidenceRoot) => {
@@ -182,7 +178,7 @@ const verifyMcpInlineArtifactEvidence = async (
       inspected.structuredContent?.normalized_result,
     );
     assert.deepEqual(
-      json(prompts.mcpText(inspected)),
+      JSON.parse(prompts.mcpText(inspected)),
       inspected.structuredContent,
     );
     const compared = await client.callTool(
@@ -249,16 +245,17 @@ const verifyMcpInlineArtifactEvidence = async (
 
 /** Connect to the packaged MCP server and verify catalog and Evidence composition. */
 export async function verifyPackageMcp({
+  commands,
   cli,
   environment,
   evidenceRoot,
   artifactArchive,
 }) {
-  const diagnosed = json(
+  const diagnosed = JSON.parse(
     (
-      await execute(cli, ["mcp", "doctor", "--json"], {
+      await commands.exec(cli, ["mcp", "doctor", "--json"], {
         env: environment,
-        timeout: MCP_STARTUP_POLICY.doctorDeadlineMs,
+        timeout: resolveMcpStartupBudgets(environment).doctor.milliseconds,
       })
     ).stdout,
   );
@@ -281,19 +278,39 @@ export async function verifyPackageMcp({
     mcpStderr += chunk.toString();
   });
   const client = new Client({ name: "package-smoke", version: "1.0.0" });
-  try {
-    await client.connect(transport);
-    const mcpOptions = { timeout: 15_000 };
-    await verifyMcpToolsAndPrompts(client, mcpOptions);
-    await verifyMcpTargetFree(client, mcpOptions);
-    await verifyMcpUnknownProvider(client, mcpOptions);
-    await verifyMcpBinaryLifecycle(client, mcpOptions);
-    await verifyMcpInlineArtifactEvidence(client, mcpOptions, artifactArchive);
-    await verifyMcpEvidenceBundle(client, mcpOptions, evidenceRoot);
-  } catch (cause) {
-    throw new Error(`packaged MCP smoke failed: ${mcpStderr}`, { cause });
-  } finally {
-    await client.close();
-    await transport.close();
-  }
+  await withVerifierCleanup(async () => {
+    try {
+      await client.connect(transport);
+      const mcpOptions = { timeout: 15_000 };
+      await verifyMcpToolsAndPrompts(client, mcpOptions);
+      await verifyMcpTargetFree(client, mcpOptions);
+      await verifyMcpUnknownProvider(client, mcpOptions);
+      await verifyMcpBinaryLifecycle(client, mcpOptions);
+      await verifyMcpInlineArtifactEvidence(
+        client,
+        mcpOptions,
+        artifactArchive,
+      );
+      await verifyMcpEvidenceBundle(client, mcpOptions, evidenceRoot);
+    } catch (cause) {
+      throw new Error(`packaged MCP smoke failed: ${mcpStderr}`, { cause });
+    }
+  }, [
+    async () => {
+      try {
+        await client.close();
+      } catch (cause) {
+        commands.adopt(client, "packaged MCP client");
+        throw cause;
+      }
+    },
+    async () => {
+      try {
+        await transport.close();
+      } catch (cause) {
+        commands.adopt(transport, "packaged MCP transport");
+        throw cause;
+      }
+    },
+  ]);
 }

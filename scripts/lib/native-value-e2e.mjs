@@ -11,11 +11,15 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { parseEvidence } from "../../dist/domain/evidence.js";
 import { analysisProfileSchema } from "../../dist/domain/analysisProfile.js";
 import { nativeValueTraceSchema } from "../../dist/domain/native/nativeValueTrace.js";
+import { requireMcpLifecycleResult } from "./mcp-verifier-results.mjs";
 import { verifyGhidraBoundaries } from "./real-ghidra-boundaries.mjs";
 
 const defaultEntrypoint = fileURLToPath(new URL("../rea.mjs", import.meta.url));
 const environment = () => ({
   PATH: process.env.PATH ?? "/usr/bin:/bin",
+  ...(process.env.NODE_OPTIONS === undefined
+    ? {}
+    : { NODE_OPTIONS: process.env.NODE_OPTIONS }),
   REA_LOG_LEVEL: "silent",
   REA_ANALYSIS_PROVIDER: "ghidra",
   HOPPER_LAUNCHER_PATH: "/rea-unconfigured-deep-provider/hopper",
@@ -169,13 +173,16 @@ async function verifyNativeValueAdapters(
       { timeout: 180000 },
     );
     assert.notEqual(opened.isError, true, JSON.stringify(opened));
-    const inventory = await client.callTool({
+    const inventoryReply = await client.callTool({
       name: "binary_session",
       arguments: {},
     });
-    assert.notEqual(inventory.isError, true, JSON.stringify(inventory));
+    const inventory = requireMcpLifecycleResult(
+      inventoryReply,
+      "binary_session",
+    );
     assert.ok(
-      inventory.structuredContent?.result?.tool_availability.some(
+      inventory.tool_availability.some(
         (tool) => tool.name === "trace_native_values" && tool.available,
       ),
       "Native value tracing is unavailable in real provider discovery",
@@ -201,13 +208,37 @@ async function verifyNativeValueAdapters(
     assert.deepEqual(mcpEvidence.normalized_result, mcpGraph);
     assert.deepEqual(mcpGraph, cliGraph);
     const analyzed = await client.callTool(
-      { name: "analyze_function", arguments: { procedure } },
+      {
+        name: "analyze_function",
+        arguments: { procedure, detail: "complete" },
+      },
       { timeout: 180000 },
     );
     assert.notEqual(analyzed.isError, true, JSON.stringify(analyzed));
     const functionEvidence = parseEvidence(analyzed.structuredContent);
     assert.equal(functionEvidence.operation, "analyze_function");
     assert.equal(functionEvidence.provider.id, "ghidra");
+    assert.deepEqual(
+      functionEvidence.normalized_result.facet_availability,
+      Object.fromEntries(
+        [
+          "pseudocode",
+          "assembly",
+          "comments",
+          "callers",
+          "callees",
+          "references",
+          "strings_names",
+          "cfg",
+        ].map((facet) => [facet, { available: true }]),
+      ),
+    );
+    assert.equal(functionEvidence.relationship_coverage?.status, "complete");
+    assert.ok(
+      functionEvidence.relationship_coverage.diagnostics.some((diagnostic) =>
+        diagnostic.includes("indirect calls remain unknown"),
+      ),
+    );
     const functionProfile = analysisProfileSchema.parse(
       functionEvidence.analysis_profile,
     );
@@ -228,7 +259,11 @@ async function verifyNativeValueAdapters(
     );
     assert.notEqual(comparison.isError, true, JSON.stringify(comparison));
     const comparisonEvidence = parseEvidence(comparison.structuredContent);
-    assert.equal(comparisonEvidence.normalized_result.status, "unchanged");
+    assert.equal(
+      comparisonEvidence.normalized_result.status,
+      "unchanged",
+      JSON.stringify(comparisonEvidence.normalized_result.dimensions),
+    );
     assert.deepEqual(
       comparisonEvidence.normalized_result,
       comparison.structuredContent?.normalized_result,
@@ -236,6 +271,7 @@ async function verifyNativeValueAdapters(
     assert.ok(
       comparisonEvidence.evidence_links.includes(functionEvidence.evidence_id),
     );
+    await verifyUnresolvedCallEvidence(client);
     const bundle = await client.callTool({
       name: "get_evidence_bundle",
       arguments: {},
@@ -264,11 +300,14 @@ async function verifyNativeValueAdapters(
       arguments: {},
     });
     assert.notEqual(closed.isError, true, JSON.stringify(closed));
-    const status = await client.callTool({
+    const statusReply = await client.callTool({
       name: "binary_session",
       arguments: {},
     });
-    assert.equal(status.structuredContent?.result?.open, false);
+    assert.equal(
+      requireMcpLifecycleResult(statusReply, "binary_session").open,
+      false,
+    );
     assert.deepEqual(
       (await readdir(env.TMPDIR)).filter((name) =>
         name.startsWith("rea-ghidra-"),
@@ -292,4 +331,67 @@ async function verifyNativeValueAdapters(
     decompilations: cliGraph.decompilations,
     unknowns: cliGraph.unknowns.length,
   };
+}
+
+async function verifyUnresolvedCallEvidence(client) {
+  const inventory = await client.callTool({
+    name: "list_procedures",
+    arguments: {},
+  });
+  assert.notEqual(inventory.isError, true, JSON.stringify(inventory));
+  const procedures = parseEvidence(
+    inventory.structuredContent,
+  ).normalized_result;
+  const indirect = procedures.find((item) =>
+    item.value.endsWith("rea_ghidra_inventory_indirect"),
+  );
+  const leaf = procedures.find((item) =>
+    item.value.endsWith("rea_ghidra_inventory_leaf"),
+  );
+  assert.ok(
+    indirect && leaf,
+    "Source fixture lacks the unresolved callback and its possible target",
+  );
+  const analyzed = await client.callTool(
+    {
+      name: "analyze_function",
+      arguments: { procedure: indirect.address, detail: "complete" },
+    },
+    { timeout: 180000 },
+  );
+  assert.notEqual(analyzed.isError, true, JSON.stringify(analyzed));
+  const evidence = parseEvidence(analyzed.structuredContent);
+  assert.equal(evidence.relationship_coverage?.status, "partial");
+  assert.ok(evidence.normalized_result.unresolved_calls.length > 0);
+  const traced = await client.callTool(
+    {
+      name: "trace_call_path",
+      arguments: {
+        start: indirect.address,
+        goal: leaf.address,
+        direction: "forward",
+      },
+    },
+    { timeout: 180000 },
+  );
+  assert.notEqual(traced.isError, true, JSON.stringify(traced));
+  const trace = parseEvidence(traced.structuredContent).normalized_result;
+  assert.equal(trace.goal_status, "unknown");
+  assert.equal(trace.truncated, true);
+  assert.ok(trace.residual_unknowns.length > 0);
+  const compared = await client.callTool(
+    {
+      name: "compare_functions",
+      arguments: {
+        left: analyzed.structuredContent,
+        right: analyzed.structuredContent,
+      },
+    },
+    { timeout: 180000 },
+  );
+  assert.notEqual(compared.isError, true, JSON.stringify(compared));
+  assert.equal(
+    parseEvidence(compared.structuredContent).normalized_result.status,
+    "unknown",
+  );
 }

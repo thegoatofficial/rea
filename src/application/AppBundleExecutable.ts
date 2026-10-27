@@ -1,17 +1,24 @@
-import { execFile } from "node:child_process";
-import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { promisify } from "node:util";
 
+import { parseBinary } from "plist";
 import { z } from "zod";
 
+import { preflightPropertyListDecode } from "../artifacts/apple/PropertyListDecodeBudget.js";
+import { decodeBinaryPlistUids } from "../artifacts/apple/PlistScalars.js";
 import { BinaryTargetError } from "../domain/configurationErrors.js";
 import { isPathWithinRoot } from "../domain/localPath.js";
-import { parseXmlPropertyList } from "../domain/propertyListKeys.js";
+import {
+  omitPrototypeKeys,
+  parseXmlPropertyList,
+} from "../domain/propertyListKeys.js";
 import { decodeXmlPlistText } from "../domain/propertyListXmlText.js";
+import { hasBinaryPlistSignature } from "../domain/apple/appleArchiveFormat.js";
 import { err, ok, type Result } from "../domain/result.js";
+import { absoluteCallerPath } from "../filesystem/callerPath.js";
 
-const execFileAsync = promisify(execFile);
+/** Decoded representation bound for one binary Info.plist. */
+const BINARY_PLIST_DECODE_BYTES = 16 * 1024 * 1024;
 
 /** Where one app bundle layout keeps its Info.plist and program file. */
 interface BundleLayout {
@@ -37,6 +44,18 @@ export interface ResolvedAppBundle {
   readonly infoPlist?: string;
 }
 
+/** Resource-only identity for an app directory; it is not a BinaryTarget. */
+export interface ResolvedAppBundleResourceRoot {
+  /** Path selected by the caller, retained even when it is a symlink alias. */
+  readonly callerPath: string;
+  /** Canonical directory whose resources are inspected. */
+  readonly canonicalPath: string;
+  readonly infoPlistPath: string;
+  readonly layout: "contents" | "root";
+  /** No executable was opened or hashed by resource-root discovery. */
+  readonly executableSha256: string | null;
+}
+
 /** Filesystem operations used by the resolver, injectable for boundary tests. */
 export interface AppBundleFileSystem {
   readonly readFile: (path: string) => Promise<Buffer>;
@@ -59,12 +78,16 @@ export const resolveAppBundleExecutable = async (
   try {
     const layout = await presentLayout(path);
     if (layout !== undefined)
-      return resolveLayoutExecutable(path, layout, fileSystem);
+      return await resolveLayoutExecutable(path, layout, fileSystem);
     const wrapped = await wrappedBundle(path);
     if (wrapped !== undefined) {
       const wrappedLayout = await presentLayout(wrapped);
       if (wrappedLayout !== undefined)
-        return resolveLayoutExecutable(wrapped, wrappedLayout, fileSystem);
+        return await resolveLayoutExecutable(
+          wrapped,
+          wrappedLayout,
+          fileSystem,
+        );
     }
   } catch (cause: unknown) {
     if (cause instanceof BinaryTargetError) return err(cause);
@@ -81,6 +104,65 @@ export const resolveAppBundleExecutable = async (
           "No Contents/Info.plist, root Info.plist, or single Wrapper/*.app bundle was found",
         ),
       },
+    ),
+  );
+};
+
+/**
+ * Resolve only the root and Info.plist layout needed for read-only resource
+ * inspection. This intentionally does not require or guess CFBundleExecutable.
+ */
+export const findAppBundleResourceRoot = async (
+  path: string,
+  options: { readonly cwd?: string } = {},
+): Promise<
+  Result<ResolvedAppBundleResourceRoot | undefined, BinaryTargetError>
+> => {
+  const callerPath = absoluteCallerPath(
+    path,
+    options.cwd === undefined ? {} : { cwd: options.cwd },
+  );
+  try {
+    const canonicalInput = await realpath(callerPath);
+    const directLayout = await presentLayout(canonicalInput);
+    const wrapped =
+      directLayout === undefined
+        ? await wrappedBundle(canonicalInput)
+        : undefined;
+    const root = wrapped ?? canonicalInput;
+    const layout = directLayout ?? (await presentLayout(root));
+    if (layout === undefined) return ok(undefined);
+    const canonicalPath = await realpath(root);
+    return ok({
+      callerPath,
+      canonicalPath,
+      infoPlistPath: join(canonicalPath, ...layout.plist),
+      layout: layout.plist[0] === "Contents" ? "contents" : "root",
+      executableSha256: null,
+    });
+  } catch (cause: unknown) {
+    if (cause instanceof BinaryTargetError) return err(cause);
+    return err(
+      new BinaryTargetError(callerPath, errorReason(cause, callerPath), {
+        cause,
+      }),
+    );
+  }
+};
+
+/** Require a discovered bundle layout while preserving typed read failures. */
+export const resolveAppBundleResourceRoot = async (
+  path: string,
+  options: { readonly cwd?: string } = {},
+): Promise<Result<ResolvedAppBundleResourceRoot, BinaryTargetError>> => {
+  const found = await findAppBundleResourceRoot(path, options);
+  if (!found.ok) return found;
+  if (found.value !== undefined) return ok(found.value);
+  const callerPath = absoluteCallerPath(path, options);
+  return err(
+    new BinaryTargetError(
+      callerPath,
+      `app resource root has no supported Info.plist layout: ${callerPath}`,
     ),
   );
 };
@@ -156,13 +238,14 @@ const wrappedBundle = async (bundle: string): Promise<string | undefined> => {
     if (isAbsence(cause)) return undefined;
     throw cause;
   }
-  const apps = (await readdir(wrapper, { withFileTypes: true })).filter(
-    (entry) => entry.isDirectory() && entry.name.toLowerCase().endsWith(".app"),
-  );
-  const [app] = apps;
-  return apps.length === 1 && app !== undefined
-    ? join(wrapper, app.name)
-    : undefined;
+  let app: string | undefined;
+  for await (const entry of await opendir(wrapper)) {
+    if (!entry.isDirectory() || !entry.name.toLowerCase().endsWith(".app"))
+      continue;
+    if (app !== undefined) return undefined;
+    app = join(wrapper, entry.name);
+  }
+  return app;
 };
 
 const resolveLayoutExecutable = async (
@@ -190,12 +273,10 @@ const resolveLayoutExecutable = async (
 
   let name: string;
   try {
-    name =
-      plist.subarray(0, 6).toString("ascii") === "bplist"
-        ? await (fileSystem.decodeBinaryPlist ?? readBinaryPlistExecutable)(
-            plistPath,
-          )
-        : parseXmlPlistExecutable(decodeXmlPlistText(plist));
+    name = hasBinaryPlistSignature(plist)
+      ? await (fileSystem.decodeBinaryPlist?.(plistPath) ??
+          parseBinaryPlistExecutable(plist))
+      : parseXmlPlistExecutable(decodeXmlPlistText(plist));
   } catch (cause: unknown) {
     return err(
       new BinaryTargetError(
@@ -215,11 +296,24 @@ const resolveLayoutExecutable = async (
     );
   const programs = join(bundle, ...layout.programs);
   const executable = join(programs, name);
+  let canonicalBundle: string;
   try {
-    const [canonicalPrograms, canonicalExecutable] = await Promise.all([
-      fileSystem.realpath(programs),
-      fileSystem.realpath(executable),
-    ]);
+    canonicalBundle = await fileSystem.realpath(bundle);
+  } catch (cause: unknown) {
+    return err(
+      new BinaryTargetError(bundle, errorReason(cause, bundle), { cause }),
+    );
+  }
+  try {
+    const canonicalPrograms = await fileSystem.realpath(programs);
+    if (!isPathWithinRoot(canonicalBundle, canonicalPrograms))
+      return err(
+        new BinaryTargetError(
+          bundle,
+          `app program directory leaves ${layout.programsLabel}`,
+        ),
+      );
+    const canonicalExecutable = await fileSystem.realpath(executable);
     if (!isPathWithinRoot(canonicalPrograms, canonicalExecutable))
       return err(
         new BinaryTargetError(
@@ -247,6 +341,10 @@ const resolveLayoutExecutable = async (
 const parseXmlPlistExecutable = (plist: string): string => {
   // An unrelated `__proto__` entry must not make the bundle unreadable.
   const { value } = parseXmlPropertyList(plist);
+  return executableName(value);
+};
+
+const executableName = (value: unknown): string => {
   const executable = executableEntrySchema.safeParse(value);
   if (!executable.success) throw new Error("CFBundleExecutable is missing");
   return executable.data.CFBundleExecutable;
@@ -254,19 +352,17 @@ const parseXmlPlistExecutable = (plist: string): string => {
 
 const executableEntrySchema = z.looseObject({ CFBundleExecutable: z.string() });
 
-const readBinaryPlistExecutable = async (plistPath: string): Promise<string> =>
-  // `-n` strips only the newline plutil appends; it requires macOS 12+.
-  (
-    await execFileAsync("/usr/bin/plutil", [
-      "-extract",
-      "CFBundleExecutable",
-      "raw",
-      "-n",
-      "-o",
-      "-",
-      plistPath,
-    ])
-  ).stdout;
+/** Decode a binary plist in-process, so no host plist tool is required. */
+const parseBinaryPlistExecutable = (plist: Buffer): string => {
+  const plan = preflightPropertyListDecode(plist, BINARY_PLIST_DECODE_BYTES);
+  // `plist` assigns a `__proto__` key as the prototype; copying drops it, as
+  // the XML path does.
+  return executableName(
+    omitPrototypeKeys(
+      parseBinary(decodeBinaryPlistUids(plist, plan.uidOffsetsToNormalize)),
+    ).value,
+  );
+};
 
 const isSafeExecutableName = (name: string): boolean =>
   name.length > 0 &&

@@ -9,6 +9,7 @@ import {
   startRuntimeBrowser,
 } from "../../fixtures/webRuntime.js";
 import type { FakeOptions } from "../../fixtures/fakeCdpBrowser.js";
+import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
 
 const fixture = async (options: FakeOptions = {}) => {
   const browser = await startRuntimeBrowser(options);
@@ -109,6 +110,45 @@ describe("native runtime producer boundary", () => {
 });
 
 describe("runtime window and producer granularity", () => {
+  it("fails malformed frame identity and completes execution cleanup", async () => {
+    const { browser, provider, execution } = await fixture();
+    const result = await provider.observeExecution(
+      { ...execution, observation_ms: 30_000 },
+      {
+        progress: {
+          report: async (update) => {
+            if (update.completed !== 1) return;
+            browser.emitEvent({
+              method: "Page.frameNavigated",
+              sessionId: "session-1",
+              params: {
+                frame: {
+                  id: "other-frame",
+                  parentId: 7,
+                  url: "https://example.test/child",
+                },
+              },
+            });
+          },
+        },
+      },
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: "BrowserObservationError", reason: "protocol_error" },
+    });
+    expect(
+      browser.commands.some(
+        (command) => command.method === "Profiler.stopPreciseCoverage",
+      ),
+    ).toBe(true);
+    expect(
+      browser.commands.some(
+        (command) => command.method === "Target.detachFromTarget",
+      ),
+    ).toBe(true);
+  });
+
   it("ends at document replacement and leaves coverage explicitly unavailable", async () => {
     const { browser, provider, execution } = await fixture();
     const result = await provider.observeExecution(
@@ -186,6 +226,107 @@ describe("runtime window and producer granularity", () => {
     );
     expect(result.value.script_inventory.coverage_absence).toBe("unknown");
   });
+});
+
+it("joins a reordered multi-script coverage sample by identity and preserves unavailable bounds", async () => {
+  const texts = new Map(
+    Array.from({ length: 256 }, (_, index) => [
+      `script-${index}`,
+      `// 🔥\r\n${" ".repeat(index)}function f(){return ${index};}`,
+    ]),
+  );
+  const { browser, provider, execution } = await fixture({
+    commandEvents: (command, origin) =>
+      command.method === "Debugger.enable"
+        ? [...texts.keys(), "foreign-script"].map((scriptId) => ({
+            ...(command.sessionId === undefined
+              ? {}
+              : { sessionId: command.sessionId }),
+            method: "Debugger.scriptParsed",
+            params: {
+              scriptId,
+              url: `${origin}/shared.js`,
+              executionContextId: scriptId === "foreign-script" ? 99 : 1,
+              startLine: 0,
+              startColumn: 0,
+              endLine: 1,
+              endColumn: 0,
+            },
+          }))
+        : undefined,
+    commandError: (command) =>
+      command.method === "Debugger.getScriptSource" &&
+      command.params.scriptId === "script-128"
+        ? { code: -32000, message: "Selected source is unavailable" }
+        : undefined,
+    commandResult: (command, origin) => {
+      if (command.method === "Debugger.getScriptSource")
+        return { scriptSource: texts.get(String(command.params.scriptId)) };
+      if (command.method !== "Profiler.takePreciseCoverage") return undefined;
+      return {
+        timestamp: 13,
+        result: [...texts]
+          .reverse()
+          .map(([scriptId, text]) => ({
+            scriptId,
+            url: `${origin}/shared.js`,
+            functions: [
+              {
+                functionName: "f",
+                isBlockCoverage: true,
+                ranges: [
+                  { startOffset: 0, endOffset: text.length, count: 1 },
+                  { startOffset: 8, endOffset: 9, count: 0 },
+                ],
+              },
+            ],
+          }))
+          .concat([
+            {
+              scriptId: "foreign-script",
+              url: `${origin}/shared.js`,
+              functions: [],
+            },
+          ]),
+      };
+    },
+  });
+  const result = await provider.observeExecution(execution);
+  if (!result.ok) throw result.error;
+  expect(result.value.coverage.excluded_scripts).toBe(1);
+  expect(
+    result.value.coverage.scripts.map(({ script_id }) => script_id),
+  ).toEqual([...texts.keys()].reverse());
+  for (const script of result.value.coverage.scripts) {
+    expect(script.functions[0]?.ranges).toEqual([
+      {
+        start_offset: 0,
+        end_offset: texts.get(script.script_id)?.length,
+        count: 1,
+        source_bounds:
+          script.script_id === "script-128" ? "unknown" : "verified",
+      },
+      {
+        start_offset: 8,
+        end_offset: 9,
+        count: 0,
+        source_bounds:
+          script.script_id === "script-128" ? "unknown" : "verified",
+      },
+    ]);
+  }
+  expect(
+    result.value.sources.find(({ script_id }) => script_id === "script-128")
+      ?.source,
+  ).toMatchObject({ state: "unavailable" });
+  expect(
+    browser.commands.some(
+      ({ method }) => method === "Profiler.stopPreciseCoverage",
+    ),
+  ).toBe(true);
+  expect(
+    browser.commands.some(({ method }) => method === "Target.detachFromTarget"),
+  ).toBe(true);
 });
 
 describe("runtime source and listener identity", () => {
@@ -426,6 +567,42 @@ describe("runtime document identity and authorization failures", () => {
             ? "observe_web_execution"
             : "inspect_web_event_listeners",
       });
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        code: "target_unavailable",
+        message: expect.stringContaining("permitted HTTP(S) origin scope"),
+        remediation: { action: expect.stringContaining("allowed_origins") },
+      });
     },
   );
+
+  it("keeps runtime document-scope recovery when the producer retains the same document identity", async () => {
+    const { provider, listeners } = await fixture({
+      commandResult: ({ method }, origin, frameReads) =>
+        method === "Page.getFrameTree"
+          ? {
+              frameTree: {
+                frame: {
+                  id: "runtime-main",
+                  loaderId: "document-1",
+                  url:
+                    frameReads === 1
+                      ? origin + "/app"
+                      : "https://outside.example/page",
+                },
+              },
+            }
+          : undefined,
+    });
+    const result = await provider.inspectEventListeners(listeners);
+    if (result.ok) throw new Error("Expected runtime document-scope refusal");
+    expect(projectAnalysisError(result.error)).toMatchObject({
+      code: "target_unavailable",
+      message: expect.stringContaining("moved to an unselected origin"),
+      remediation: { action: expect.stringContaining("allowed_origins") },
+      details: {
+        operation: "inspect_web_event_listeners",
+        reason: "target_not_allowed",
+      },
+    });
+  });
 });

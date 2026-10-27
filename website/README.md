@@ -4,11 +4,22 @@
 >
 > — N0zoM1z0
 
-An English static website with explanatory figures, worked guides and Aegis, DX-Ball, Notion, TH04 and CTF investigations.
-The public files are in `website/public/`. The site uses HTML, CSS and small
+An English website with translated editions in every README language, explanatory
+figures, worked guides and Aegis, DX-Ball, Notion, TH04 and CTF investigations.
+English sources are in `website/public/`; translations are standard gettext PO
+catalogs in `website/locales/`. The site uses HTML, CSS and small
 scripts for copying code, following code comparisons and playing the dinosaur
-speed reconstruction. Python prepares the example ZIP, sitemap and sharing
-image; there is no frontend bundler or npm dependency.
+speed reconstruction. Small Python commands maintain shared HTML, prepare
+downloads and check the site. There is no frontend framework, bundler or npm
+dependency. A build generates all editions in `website/_site/`. The resulting
+files work as ordinary static files; language switching needs no JavaScript.
+
+Korean editions load the variable Noto Sans KR webfont through Google Fonts
+(`fonts.googleapis.com` and `fonts.gstatic.com`) so the preferred Korean font
+does not depend on fonts installed on the reader's PC. Other editions keep
+system fonts. Text remains visible while the font loads (`display=swap`), and
+local Korean fonts are used if Google Fonts is unavailable. The stylesheet is
+added during translation rendering; generated `_site/` pages are not authored.
 
 [style-guide.md](style-guide.md) explains the writing, page structure, figures,
 visual system and review process. Read it before adding or revising a page.
@@ -21,27 +32,148 @@ From the repository root:
 python3 -m venv website/.venv
 source website/.venv/bin/activate
 python3 -m pip install -r website/requirements.txt
-python3 scripts/prepare-website.py
-python3 -m http.server 4173 --bind 127.0.0.1 --directory website/public
+python3 scripts/website.py serve
 ```
 
 Open <http://127.0.0.1:4173/>. Refresh the browser after editing a file.
+After editing source HTML or a catalog, run `python3 scripts/prepare-website.py`
+to rebuild the preview. `serve` prepares the site once when it starts.
 Keep the virtual environment active when preparing assets. CairoSVG needs the
 native Cairo library; the sharing card uses DejaVu Sans. On Debian or Ubuntu,
-install them with `sudo apt-get install libcairo2 fonts-dejavu-core`. For other
-systems, see [CairoSVG's installation instructions](https://cairosvg.org/documentation/#installation).
+install them with `sudo apt-get install libcairo2 fonts-dejavu-core`. On an
+Apple Silicon Mac, enter an ARM shell first with `/usr/bin/arch -arm64 /bin/zsh`. Install
+the ARM build with `/opt/homebrew/bin/brew install cairo pkg-config`. Install
+the sharing-card font with `/opt/homebrew/bin/brew install --cask font-dejavu`.
+The card in `public/assets/social-card.svg` requests DejaVu Sans, so Cairo output
+uses a fallback font without it. Verify with `fc-match "DejaVu Sans"`. The result
+should name DejaVu. A plain
+`brew` call can select the Intel brew when `/usr/local/bin` comes first or the
+terminal runs under Rosetta. Check that
+`/opt/homebrew/lib/libcairo.dylib` reports `arm64`. An old Intel build in
+`/usr/local/lib` shadows the ARM build. The preview then fails with
+`incompatible architecture (have 'x86_64', need 'arm64')`. Keep
+`/usr/local/lib` intact. Do not move its files and do not link ARM files into
+it. That breaks Intel programs that use the same names. Use an unprotected ARM
+Python, not Apple `/usr/bin/python3`. A venv from the Apple interpreter stays
+protected and purges `DYLD` at launch. Deactivate any active venv, confirm the
+shell reports `arm64`, then recreate the venv with the ARM interpreter by its
+full path:
+
+```sh
+deactivate || true
+/usr/bin/arch
+/opt/homebrew/bin/brew install python3
+/opt/homebrew/bin/python3 -m venv website/.venv --clear
+source website/.venv/bin/activate
+python3 -m pip install -r website/requirements.txt
+```
+
+A rebuilt venv is empty
+without this step. Export `DYLD_LIBRARY_PATH=/opt/homebrew/lib` and
+`DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` inside the ARM shell. Verify
+with `python3 -c "import ctypes.util;
+print(ctypes.util.find_library('cairo'))"`. The result should point at
+`/opt/homebrew`. Run the preview from that same shell with
+`python3 scripts/website.py serve` and no `arch` prefix. A `DYLD` export
+before `arch` gets purged and the preview fails again. For other systems, see
+[CairoSVG's installation instructions](https://cairosvg.org/documentation/#installation).
 CI installs both packages explicitly before rendering the card.
 
-After adding, moving or removing a page, or changing its indexing policy, rerun
-`python3 scripts/prepare-website.py`. It regenerates the sitemap from the current
-HTML files. No URL list needs to be maintained.
+To test the GitHub Pages prefix, use
+`python3 scripts/website.py serve --port 4174 --base-path /rea/` and open
+<http://127.0.0.1:4174/rea/>.
+
+## Contribute a page or correction
+
+Edit the page's HTML in `public/`. Keep the question, evidence and result easy to
+follow. The writing and design guidance in [style-guide.md](style-guide.md)
+applies to every page.
+
+| Change                          | Edit                                                             | Then run                                        |
+| ------------------------------- | ---------------------------------------------------------------- | ----------------------------------------------- |
+| Page text, examples or figures  | The page's HTML outside the marked shared regions                | `python3 scripts/website.py check`              |
+| Search title or description     | The page's `<title>` and first description meta tag              | `python3 scripts/website.py sync`, then `check` |
+| Main navigation                 | `NAVIGATION` in `scripts/website.py`                             | `sync`, then `check`                            |
+| Header, social links or footer  | `templates/header.html.tmpl` or `templates/footer.html.tmpl`     | `sync`, then `check`                            |
+| Theme loading and browser color | `templates/theme.html.tmpl` and `public/assets/theme.js`         | `sync`, then `check`                            |
+| Shared link previews            | `templates/sharing.html.tmpl` or `public/assets/social-card.svg` | `sync`, then `check`                            |
+| Translation                     | `locales/<language>/messages.po`                                 | `translations check`, then `check`              |
+
+After changing English text, run `python3 scripts/website.py translations extract`
+before `check`. Existing translations and reviewer comments survive extraction;
+new or changed sentences need updated translations. See
+[the translation guide](locales/README.md) for the editing workflow, terminology
+and the handling of pages whose translations are being updated. Never edit
+generated HTML in `_site/`.
+
+Create a reading page with:
+
+```sh
+python3 scripts/website.py new-page blog/my-article \
+  --title "My article title" \
+  --description "One sentence explaining the article."
+```
+
+The command creates `public/blog/my-article/index.html` with the correct relative
+paths, navigation and sharing metadata. It starts as a visible draft with
+`noindex`. Write the article, add its link to the Blog index, then remove the
+Draft label and robots meta tag when it is ready. The same command accepts
+routes under `guides/` and `showcase/`. New pages still need their own content;
+the scaffold supplies the common structure.
+
+The regions marked `website:sharing`, `website:header` and `website:footer` are
+generated from the templates. Edit the template rather than a generated copy.
+The `.html.tmpl` partials own their generated whitespace; HTML formatter-ignore
+comments keep the repository formatter from changing those regions. Their
+content is checked by `sync --check`, while ordinary page content stays subject
+to the repository formatter.
+`sync` updates only those regions; page bodies, figures and scripts remain
+authored HTML. Commit the updated pages alongside the template. Titles and
+descriptions are written once per page; their sharing fields are derived from
+them. Routes come from file paths, including the sitemap, so there is no second
+page list to register.
+
+Before opening a PR:
+
+```sh
+python3 scripts/website.py check
+```
+
+This checks shared HTML and translation sources without rewriting them, prepares
+all language editions and generated assets, and
+checks page links, copied-text targets, repository documentation links, SEO
+metadata and the publishing configuration. It also runs the maintenance
+regressions. A stale shared region fails with the command needed to fix it.
+PR checks and the manual publisher run this same command. The checks work
+offline after the Python dependencies are installed.
+
+For an optional external-link audit, with GitHub CLI available:
+
+```sh
+python3 scripts/website.py links --report /tmp/rea-website-links.json
+```
+
+GitHub source links are checked through `gh`, including pinned commits and
+branch names containing slashes. Other external links use HTTP. Missing targets
+fail the command; access denials, timeouts and GitHub UI routes are reported as
+unknown and need manual verification. External fragment IDs are not checked.
+This network audit runs separately so third-party uptime does not block every PR.
+Keep its report outside public assets.
+
+Links are only part of a content review. When updating setup or support claims,
+compare them with [installation.md](../docs/installation.md), the relevant
+provider guide and the released package. A case study's pinned version and date
+describe its recorded investigation; update them only when repeating that work.
 
 ## Pages
 
-- `public/index.html`: compact setup, reverse-engineering definition and purpose, manual/agent comparison, dinosaur and Calculator examples, and analysis-guide links.
+- `public/index.html`: introduction and compact setup, a three-step overview, dinosaur and Calculator examples, case studies and analysis-guide links. Code-level comparisons and checks are optional disclosures.
 - `public/examples/dino-lab/index.html`: adjustable-speed mini-game, recovered rule, original-game check and browser analysis steps.
 - `public/first-investigation/index.html`: a guided Notes export investigation, from setup to a checked CSV prediction.
 - `public/showcase/index.html`: the case-study index.
+- `public/blog/index.html`: articles about reconstruction methods, ports, mods and reverse engineering.
+- `public/blog/touhou-reconstruction/index.html`: a personal essay about agent autonomy, oracle quality, knowledge carried between TH08 and TH095, PC-98 TH04, and the path from exact reconstruction to readable source and modern ports.
+- `public/blog/reverse-engineering-models/index.html`: an essay on general models, compiler specialization and learning useful reconstruction experiments, with historical evidence from TH08, TH095, TH04 and TH09. Model attribution and verification scope are in [evidence/reverse-engineering-models.md](evidence/reverse-engineering-models.md).
 - `public/showcase/aegis/index.html`: Aegis's Android login-code calculation, with an adjustable clock and reference checks.
 - `public/showcase/dx-ball/index.html`: sound-pan investigation and project status.
 - `public/showcase/notion/index.html`: Notion's Electron clipboard bridge and rich clipboard format.
@@ -49,12 +181,36 @@ HTML files. No URL list needs to be maintained.
 - `public/showcase/ctf/index.html`: DownUnderCTF's masked-squares flag checker, extracted equations and real process captures.
 - `public/get-started/index.html`: agent setup, first CLI result and provider guides.
 - `public/faq/index.html`: concise answers about setup, updates, analysis and troubleshooting.
+- `public/contributors/index.html`: one searchable, alphabetical grid of GitHub contributors, with profile links and contribution guidance.
 - `public/guides/`: a guide hub and native, JavaScript/Electron and browser examples.
 - `public/examples/`: downloadable Electron source and an interactive Notes browser app.
 - `public/assets/`: shared styles, interactions, favicon and explanatory figures.
 
 Navigation and assets use relative paths, so the same files work at the local
 root and a GitHub Pages project path such as `/rea/`.
+
+### Update contributors
+
+`public/contributors/people.json` is a dated snapshot of the repository's public
+GitHub contributor list, including accounts GitHub identifies as bots. Every
+profile has the same presentation; there are no team tiers or contribution
+rankings. The page links the source list and shows the snapshot date. Avatars
+load from GitHub; usernames and profile links remain usable without images or
+JavaScript. Search is a small progressive enhancement.
+
+Refresh the snapshot with GitHub CLI available, then regenerate the marked
+`website:contributors` region from `templates/contributors.html.tmpl`:
+
+```sh
+python3 scripts/website.py contributors
+python3 scripts/website.py sync
+python3 scripts/website.py translations extract
+python3 scripts/website.py check
+```
+
+Refresh fetches every API page and validates the complete result before replacing
+the snapshot. Review and commit the JSON, rendered page and catalog updates
+together. Builds and offline checks use that snapshot, not the live API.
 
 ## Search and sharing metadata
 
@@ -65,14 +221,15 @@ navigation and asset references remain relative so both hosts and local previews
 keep working.
 
 Maintain a descriptive `<title>` and a short meta description in each page's
-`<head>`. The title names the page's subject; visible headings keep the wording
-that best explains it to a reader. Open Graph and Twitter titles/descriptions
-match those fields. `og:url` matches the canonical, and sharing images use
-absolute rea.tools URLs. Search results and link previews should follow the same
-clear, concise writing standard as the page.
+`<head>`, then run `sync`. The title names the page's subject; visible headings
+keep the wording that best explains it to a reader. The script derives Open
+Graph and Twitter fields and the canonical from those inputs and the file's
+route. Search results and link previews should follow the same clear, concise
+writing standard as the page.
 
-`scripts/prepare-website.py` scans `public/**/*.html` and generates
-`public/sitemap.xml` with absolute rea.tools URLs. An `index.html` maps to its
+`scripts/prepare-website.py` renders `public/` and the PO catalogs into `_site/`,
+then scans `_site/**/*.html` and generates `_site/sitemap.xml` with absolute
+rea.tools URLs. An `index.html` maps to its
 directory route; other HTML filenames retain their extension. Pages with
 `noindex` or `none` in a head `robots` or `googlebot` meta directive are excluded.
 The two Notes example applications use `noindex`; their guides and the dinosaur
@@ -99,8 +256,7 @@ canonicals, lost fixture exclusions, stale sitemap entries and missing previews.
 Run it after preparing assets:
 
 ```sh
-python3 scripts/verify-website.py
-python3 scripts/test-website.py
+python3 scripts/website.py check
 ```
 
 ### After publishing an SEO change
@@ -121,6 +277,23 @@ and Cloudflare's [managed robots behavior](https://developers.cloudflare.com/bot
 
 ## Content
 
+Blog articles explain methods, decisions and ideas through project experience.
+Lead with a takeaway, then develop the argument through concrete examples.
+An essay can explore a change in perspective without becoming a step-by-step
+guide. Add a figure when it contributes a useful explanation; an opening flow
+is optional. Case studies remain focused on one inspected behavior. Keep engine
+details in supporting references unless they explain a relevant decision.
+
+The Touhou article is authored in English and translated through the same catalogs. Its provenance,
+quoted README passage and milestone counting rules are in
+[evidence/touhou-reconstruction-method.md](evidence/touhou-reconstruction-method.md).
+The completed text has normal search metadata and is included in the generated
+sitemap.
+
+Its opening flywheel connects agent autonomy, reference-based oracles and
+repository memory. The essay develops those ideas through the project examples.
+Figure labels are selectable HTML; inline SVG supplies the feedback arrows.
+
 Keep the copy direct and specific. Explain the task and the result before listing
 tool names. Setup commands and runtime requirements should match the released
 package. Keep the core learning path inside the site. Source, issue and evidence
@@ -136,7 +309,7 @@ The Electron guide offers one ZIP containing the six source files under
 `notes-example/`. `scripts/prepare-website.py` generates this download from
 an explicit file list, with fixed timestamps and permissions. The ZIP is ignored
 by Git; website checks and each manual publication regenerate it before checking
-and uploading the public directory. The verifier checks that its entries match
+and uploading `_site/`. The verifier checks that its entries match
 the current source and contain no extra files.
 
 The first-investigation page uses this same ZIP. Its prompt lets the agent
@@ -150,6 +323,19 @@ investigations. All cursors blink continuously with the same CSS animation,
 respecting reduced-motion preferences. Both the prompt and animation work
 without JavaScript. The homepage and agent setup section share a copyable
 installation prompt; setup still presents its plan for approval.
+
+The header's sun/moon button switches the color theme. A first visit follows the
+system preference, falling back to light when no preference is given. Manual
+choices are saved in browser storage under `rea-theme` and apply across pages,
+language editions and tabs on the same host. If storage is blocked, the button
+still works for the current page. Without JavaScript, the site stays light and
+the button stays hidden.
+
+The shared `theme` head region loads `assets/theme.js` before the stylesheet so a
+saved choice applies before the first paint. That script owns the resolved
+`data-theme`, browser `theme-color` and `website-theme-change` event. The CSS
+palette, embedded SVGs and dinosaur canvas follow that choice. Keep the theme
+region in the page scaffold and run `sync` after editing its template.
 
 Reading pages share a small `↑ Top` link at the bottom right. It appears after
 scrolling and returns to the page header, with smooth scrolling when reduced
@@ -173,15 +359,23 @@ Evidence. [evidence/dx-ball-sound-pan.md](evidence/dx-ball-sound-pan.md) records
 their provenance and the scope of the validation claims. The original executable
 and complete private Evidence records are not website assets.
 
-The homepage starts with a short installation prompt and the ordinary setup
-command, then explains what reverse engineering is and why someone would use
-it. The manual/agent comparison introduces REA’s role before the examples.
-Its opening links directly to Showcases and lets experienced readers skip to
-the analysis guides. Case-study previews live on the Showcases page.
-The closing section offers copyable project prompts, from cloning `rea.tools`
-to reconstructing a game from its executable. The experienced-reader shortcut
-lands directly on the guide links below these prompts.
-The page ends with FAQ, Discord and issue-report links under “Any questions?”.
+The homepage pairs a short introduction with the installation prompt and
+ordinary setup command. Get started is the primary action; a second link goes
+straight to the first interactive example. Short Showcases and Blog descriptions
+below those actions keep both reading paths available. The introduction and
+setup retain the original equal-width desktop columns. Platform links go
+directly to the Windows, macOS and Linux steps in Get started; the optional
+curl installer is listed separately and links to its on-site instructions.
+The setup-guide link
+starts on its own line. A full-width definition and three steps explain the
+workflow, followed by a short transition into the dinosaur and Calculator
+cases. The detailed manual/agent comparison is folded,
+as are each example's investigation flow and verification details. Plain
+paragraphs introduce the cases without repeating goal and purpose panels.
+Three case-study previews lead to further investigations. The closing sections
+offer a guided first task and target-specific guides. FAQ, Discord and issue
+links each have their own line explaining their purpose.
+Every content page's header and footer link GitHub, Discord and X.
 A right-side table of contents stays visible at widths of 1440px and above.
 On narrower screens it becomes a sticky, native disclosure; selecting a link
 closes the menu and focuses the destination. The homepage script follows
@@ -189,20 +383,24 @@ the reading position and marks the current link. Without JavaScript, the
 menu stays open and its fragment links remain usable.
 The comparison uses the same Calculator question on both sides: three
 selectable manual steps pair original instructions with an analyst illustration
-and thought bubbles; the agent side begins with “One prompt.” and a copyable
-question. Thoughts illustrate the reasoning behind the findings. The shared
-code-step script selects the initial note on load, so all three notes remain
+and thought bubbles; the agent side pairs a copyable question with an
+illustrative answer. The outer disclosure opens the complete comparison, with
+the original desktop column proportions and the agent explanation first on
+mobile. Thoughts illustrate the reasoning behind the findings. The
+shared code-step script selects the initial note on load, so all three notes remain
 readable when JavaScript is disabled.
-The original-instruction panel starts expanded on desktop. On narrow screens,
-the homepage script collapses it; a native disclosure keeps the code available
-while the thought bubble and agent prompt remain close together.
+The original-instruction panel stays expanded when the comparison is opened,
+including on mobile; its native disclosure can still be closed manually.
 Dinosaur is the first example; Calculator follows as the native example.
-Both name the goal and the reason to inspect the program before showing the
-demo. A labeled finding explains what REA returned, and the flow distinguishes
-REA’s inspection from the agent’s interpretation and implementation.
-Its game precedes the prompt and code on small screens. Calculator’s excerpt
-comes from an installed model DLL; Microsoft’s public implementation supplies
+Each introduces the goal, then follows three named steps: ask a question,
+find the rule, and try a reconstruction. The question and plain-language finding
+are on the left, with the demo on the right; mobile keeps that reading order.
+Code excerpts and source details join the optional investigation flow and checks
+in each disclosure. Calculator's excerpt
+comes from an installed model DLL; Microsoft's public implementation supplies
 names and a crosscheck. Its controls apply the percentage rule to generic inputs.
+The target guides end with an optional larger-project disclosure, preserving
+the original website-cloning and game-reconstruction prompts.
 
 The dinosaur example connects an inspected running script to a new playable
 mini-game. `public/assets/dino-speed.js` owns the recovered speed rule and replay;
@@ -278,9 +476,9 @@ solver constants and evidence notes aligned when changing this case.
 
 ## Cloudflare Workers
 
-`wrangler.toml` serves `website/public/` through Workers Static Assets. There is
-no Worker script or frontend build. Before a preview or deployment, Wrangler
-runs the existing Python scripts to prepare the example ZIP and verify the
+`wrangler.toml` serves `website/_site/` through Workers Static Assets. There is
+no Worker script or frontend framework. Before a preview or deployment, Wrangler
+runs the Python scripts to build the language editions, prepare the example ZIP and verify the
 website. Node.js and Python 3 must be available; the commands below use a pinned
 Wrangler version without adding it to REA's package dependencies.
 
@@ -351,7 +549,7 @@ Local Wrangler commands above publish only the separate preview Worker.
 
 ## Synchronized production publishing
 
-`.github/workflows/website-pages.yml` prepares `website/public` once and deploys
+`.github/workflows/website-pages.yml` prepares `website/_site` once and deploys
 the same artifact to Cloudflare (`rea.tools`) and GitHub Pages. It is the sole
 production publisher, manually triggered and restricted to `main`;
 ordinary pushes and pull requests do not publish the site.
@@ -382,8 +580,7 @@ dependencies. The same asset preparation and verification run before each manual
 deployment. With the preview environment active, run them locally:
 
 ```sh
-python3 scripts/prepare-website.py
-python3 scripts/verify-website.py
+python3 scripts/website.py check
 ```
 
 `.github/workflows/pages.yml` is a separate, manual-only VitePress build. It

@@ -9,6 +9,67 @@ const resultValue = (body: string) =>
     "result",
   ).returnSites[0]?.value;
 
+it.each([
+  ["field = shared;", "declare field: { mode: string };", "new Derived()"],
+  [
+    "get field() { return shared; }",
+    "declare field: { mode: string };",
+    "new Derived()",
+  ],
+  [
+    "static field = shared;",
+    "declare static field: { mode: string };",
+    "Derived",
+  ],
+  [
+    "static get field() { return shared; }",
+    "declare static field: { mode: string };",
+    "Derived",
+  ],
+])(
+  "follows inherited references past erased class fields: %s",
+  (base, declaration, receiver) => {
+    expect(
+      resultValue(`
+    const shared = { mode: "initial" };
+    class Base { ${base} }
+    class Derived extends Base { ${declaration} }
+    ${receiver}.field.mode = "updated";
+    return shared.mode;
+  `)?.status,
+    ).toBe("unknown");
+  },
+);
+
+it.each(["field;", "field = { mode: 'other' };"])(
+  "preserves a real derived field's shadowing: %s",
+  (field) => {
+    expect(
+      resultValue(`
+      const shared = { mode: "initial" };
+      class Base { field = shared; }
+      class Derived extends Base { ${field} }
+      const instance = new Derived();
+      if (instance.field) instance.field.mode = "updated";
+      return shared.mode;
+    `),
+    ).toEqual({ status: "literal", value: "initial" });
+  },
+);
+
+it("follows inherited references past an abstract field declaration", () => {
+  expect(
+    resultValue(`
+    const shared = { mode: "initial" };
+    class Base { field = shared; }
+    abstract class Derived extends Base { abstract field: { mode: string }; }
+    const Constructor = Derived as unknown as new () => Base;
+    new Constructor().field.mode = "updated";
+    return shared.mode;
+  `)?.status,
+  ).toBe("unknown");
+});
+
 const mutations = [
   'const shared = { mode: "initial" }; const options = { [key]: shared }; options.foo.mode = "updated"; return shared.mode;',
   'const shared = { mode: "initial" }; const original = [shared]; const copy = [...original]; copy[0].mode = "updated"; return shared.mode;',
@@ -163,6 +224,211 @@ describe("JavaScript semantic values after explicit property mutations", () => {
     ).toEqual({ status: "literal", value: "initial" });
   });
 });
+
+it("invalidates a shared value reached through an object-literal prototype getter", () => {
+  const value = resultValue(`
+    const shared = { x: 1 };
+    const proto = { get v() { return shared; } };
+    const box = { __proto__: proto };
+    box.v.x = 2;
+    return shared.x;
+  `);
+  expect(
+    value?.status === "unknown" ||
+      (value?.status === "literal" && value.value === 2),
+  ).toBe(true);
+});
+
+it("does not follow an object-literal prototype getter past an own property", () => {
+  expect(
+    resultValue(`
+      const shared = { x: 1 };
+      const proto = { get v() { return shared; } };
+      const box = { __proto__: proto, v: { x: 3 } };
+      box.v.x = 2;
+      return shared.x;
+    `),
+  ).toEqual({ status: "literal", value: 1 });
+});
+
+describe("JavaScript semantic mutations through getter results (#1494)", () => {
+  it.each([
+    [
+      "object getter",
+      "const shared = { value: 1 }; const box = { get value() { return shared; } }; box.value.value = 2; return shared.value;",
+    ],
+    [
+      "class instance getter",
+      "const shared = { value: 1 }; class Box { get value() { return shared; } } const box = new Box(); box.value.value = 2; return shared.value;",
+    ],
+    [
+      "static getter",
+      "const shared = { value: 1 }; class Box { static get value() { return shared; } } Box.value.value = 2; return shared.value;",
+    ],
+    [
+      "copied getter result",
+      "const shared = { value: 1 }; const box = { get value() { return shared; } }; const alias = box.value; alias.value = 2; return shared.value;",
+    ],
+  ])("marks shared returned objects uncertain through %s", (_shape, body) => {
+    expect(resultValue(body)?.status).toBe("unknown");
+  });
+
+  it.each([
+    [
+      "last duplicate object getter wins",
+      "const shared = { value: 1 }; const box = { get value() { return shared; }, get value() { return { value: 2 }; } }; box.value.value = 3; return shared.value;",
+      "literal",
+    ],
+    [
+      "a later data property replaces an object getter",
+      "const shared = { value: 1 }; const box = { get value() { return shared; }, value: { value: 2 } }; box.value.value = 3; return shared.value;",
+      "literal",
+    ],
+    [
+      "a later object spread replaces an earlier getter",
+      "const shared = { value: 1 }; const box = { get value() { return shared; }, ...{ value: { value: 2 } } }; box.value.value = 3; return shared.value;",
+      "literal",
+    ],
+    [
+      "a dynamic computed getter can replace a static getter",
+      "const shared = { value: 1 }; const key = 'value'; const box = { get value() { return { value: 2 }; }, get [key]() { return shared; } }; box.value.value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "a dynamic instance property can select a class getter",
+      "const shared = { value: 1 }; const key = getKey(); class Box { get value() { return shared; } } const box = new Box(); box[key].value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "a dynamic static property can select a class getter",
+      "const shared = { value: 1 }; const key = getKey(); class Box { static get value() { return shared; } } Box[key].value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "a paired object setter keeps its getter result",
+      "const shared = { value: 1 }; const box = { get value() { return shared; }, set value(next) {} }; box.value.value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "a paired class setter keeps its getter result",
+      "const shared = { value: 1 }; class Box { get value() { return shared; } set value(next) {} } const box = new Box(); box.value.value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "a later class field replaces a getter",
+      "const shared = { value: 1 }; class Box { get value() { return shared; } value = { value: 2 }; } const box = new Box(); box.value.value = 3; return shared.value;",
+      "literal",
+    ],
+    [
+      "a class field shadows a getter even when declared earlier",
+      "const shared = { value: 1 }; class Box { value = { value: 2 }; get value() { return shared; } } const box = new Box(); box.value.value = 3; return shared.value;",
+      "literal",
+    ],
+    [
+      "last duplicate class getter wins",
+      "const shared = { value: 1 }; class Box { get value() { return shared; } get value() { return { value: 2 }; } } const box = new Box(); box.value.value = 3; return shared.value;",
+      "literal",
+    ],
+    [
+      "follows an inherited getter",
+      "const shared = { value: 1 }; class Base { get value() { return shared; } } class Derived extends Base {} const box = new Derived(); box.value.value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "follows every possible conditional superclass getter",
+      "const shared = { value: 1 }; class Fresh { get value() { return { value: 2 }; } } class Shared { get value() { return shared; } } class Derived extends (flag ? Fresh : Shared) {} const box = new Derived(); box.value.value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "includes an unknown computed getter that can shadow a static getter",
+      "const shared = { value: 1 }; const key = getKey(); class Box { get value() { return { value: 2 }; } get [key]() { return shared; } } const box = new Box(); box.value.value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "a later known getter shadows an earlier unknown computed getter",
+      "const shared = { value: 1 }; const key = getKey(); class Box { get [key]() { return shared; } get value() { return { value: 2 }; } } const box = new Box(); box.value.value = 3; return shared.value;",
+      "literal",
+    ],
+    [
+      "follows an aliased class constructor",
+      "const shared = { value: 1 }; class Box { get value() { return shared; } } const Alias = Box; const box = new Alias(); box.value.value = 3; return shared.value;",
+      "unknown",
+    ],
+    [
+      "follows an inline class constructor",
+      "const shared = { value: 1 }; const box = new (class { get value() { return shared; } })(); box.value.value = 3; return shared.value;",
+      "unknown",
+    ],
+  ])("%s", (_case, body, status) => {
+    expect(resultValue(body)?.status).toBe(status);
+  });
+
+  it("retains conservative unknowns for fresh getter reads and saved results", () => {
+    expect(
+      resultValue(
+        "const box = { get value() { return { x: 1 }; } }; const first = box.value; first.x = 2; return box.value.x;",
+      )?.status,
+    ).toBe("unknown");
+    expect(
+      resultValue(
+        "const box = { get value() { return { x: 1 }; } }; const saved = box.value; saved.x = 2; return saved.x;",
+      )?.status,
+    ).toBe("unknown");
+  });
+
+  it("does not invalidate unrelated state through a fresh getter result", () => {
+    expect(
+      resultValue(
+        "const shared = { value: 1 }; const box = { get fresh() { return { value: 2 }; } }; box.fresh.value = 3; return shared.value;",
+      ),
+    ).toEqual({ status: "literal", value: 1 });
+  });
+
+  it("keeps a shared value known when its getter is never read", () => {
+    expect(
+      resultValue(
+        "const shared = { value: 1 }; const box = { get value() { return shared; } }; return shared.value;",
+      ),
+    ).toEqual({ status: "literal", value: 1 });
+  });
+
+  it("keeps a shared value known after an optional getter read or ordinary method read", () => {
+    expect(
+      resultValue(
+        "const shared = { value: 1 }; const box = { get value() { return shared; } }; const alias = box?.value; return shared.value;",
+      ),
+    ).toEqual({ status: "literal", value: 1 });
+    expect(
+      resultValue(
+        "const shared = { value: 1 }; const box = { value() { return shared; } }; const alias = box.value; return shared.value;",
+      ),
+    ).toEqual({ status: "literal", value: 1 });
+  });
+});
+
+it.each([
+  [
+    "instance getter assignment",
+    "const shared = { value: 1 }; class Box { get value() { return shared; } } const box = new Box(); box.value = {}; return shared.value;",
+  ],
+  [
+    "instance getter deletion",
+    "const shared = { value: 1 }; class Box { get value() { return shared; } } const box = new Box(); delete box.value; return shared.value;",
+  ],
+  [
+    "static getter assignment",
+    "const shared = { value: 1 }; class Box { static get value() { return shared; } } Box.value = {}; return shared.value;",
+  ],
+  [
+    "static getter deletion",
+    "const shared = { value: 1 }; class Box { static get value() { return shared; } } delete Box.value; return shared.value;",
+  ],
+])(
+  "does not follow a class getter for direct property replacement or deletion (%s)",
+  (_name, body) => {
+    expect(resultValue(body)).toEqual({ status: "literal", value: 1 });
+  },
+);
 
 describe("JavaScript semantic values after mutable references escape", () => {
   it("preserves copied scalar slots while invalidating shared children of an escaped object spread", () => {
@@ -590,3 +856,102 @@ describe("property mutations through TypeScript satisfies aliases", () => {
     ).toEqual({ status: "literal", value: "TOKEN" });
   });
 });
+
+describe("property mutation collection on minified bundles", () => {
+  it("records each write to one object without replaying earlier writes", () => {
+    const writes = Array.from(
+      { length: 2000 },
+      (_, index) => `source.p${index} = ${index};`,
+    ).join(" ");
+    const value = resultValue(
+      `const source = { token: "TOKEN" }; ${writes} return [source.token, source.p1999];`,
+    );
+    expect(value).toMatchObject({
+      status: "array",
+      items: [
+        { value: { status: "literal", value: "TOKEN" } },
+        { value: { status: "unknown" } },
+      ],
+    });
+  }, 30000);
+
+  it("indexes many returned object methods instead of rescanning the object", () => {
+    const methods = Array.from(
+      { length: 2000 },
+      (_, index) => `m${index}() { return shared; }`,
+    ).join(",");
+    const writes = Array.from(
+      { length: 2000 },
+      (_, index) => `box.m${index}().p${index} = ${index};`,
+    ).join(" ");
+    const value = resultValue(
+      `const shared = { token: "TOKEN" }; const box = { ${methods} }; ${writes} return shared.token;`,
+    );
+    expect(value?.status).toBe("unknown");
+  }, 30000);
+});
+
+describe("results of methods on an escaped receiver", () => {
+  it("makes every method's distinct result uncertain, not only the called one", () => {
+    expect(
+      resultValue(
+        'const first = { t: "A" }; const second = { t: "B" }; const kept = { t: "C" }; const box = { a() { return first; }, b() { return second; }, c() { return first; } }; box.a(); return [first.t, second.t, kept.t];',
+      ),
+    ).toMatchObject({
+      status: "array",
+      items: [
+        { value: { status: "unknown" } },
+        { value: { status: "unknown" } },
+        { value: { status: "literal", value: "C" } },
+      ],
+    });
+  });
+
+  it("keeps a shared result uncertain across a wide escaped receiver (#1495)", () => {
+    const count = 2000;
+    const methods = Array.from(
+      { length: count },
+      (_, index) => `m${index}() { return shared; },`,
+    ).join(" ");
+    const calls = Array.from(
+      { length: count },
+      (_, index) => `box.m${index}().p${index} = ${index};`,
+    ).join(" ");
+    const value = resultValue(
+      `const shared = { token: "TOKEN" }; const box = { ${methods} }; ${calls} return [shared.token];`,
+    );
+    expect(value).toMatchObject({
+      status: "array",
+      items: [{ value: { status: "unknown" } }],
+    });
+  }, 30000);
+});
+
+it.each([
+  ["named", "@dec abstract slot: { mode: string };"],
+  ["computed literal", '@dec abstract ["slot"]: { mode: string };'],
+])(
+  "retains the possible inherited alias through a decorated abstract %s field",
+  (_name, field) => {
+    // An emit that erases the field lets this write reach Base.slot. The
+    // analysis must still invalidate shared even if another emit shadows it.
+    const setup = `
+      function dec(...args: unknown[]) {}
+      const shared = { mode: "initial" };
+      class Base { slot = shared; }
+      abstract class Derived extends Base { ${field} }
+      const Constructor = Derived as unknown as new () => Base;
+    `;
+    expect(resultValue(`${setup} return shared.mode;`)).toEqual({
+      status: "literal",
+      value: "initial",
+    });
+    expect(
+      resultValue(`
+        ${setup}
+        new Constructor().slot.mode = "updated";
+        return shared.mode;
+      `),
+    ).toMatchObject({ status: "unknown" });
+  },
+);

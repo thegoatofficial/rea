@@ -76,6 +76,35 @@ describe("managed native boundaries", () => {
       "P/Invoke rows prove managed import declarations only; this inspection does not verify that a native library, export, thunk, or provider-qualified function exists.",
     );
   });
+
+  it.each([
+    {
+      name: "C++/CLI with a native method body",
+      options: {
+        cliFlags: 0,
+        methods: [
+          { name: "NativeMethod", body: Buffer.from([0xc3]), implFlags: 1 },
+        ],
+      },
+      mixed: true,
+    },
+    {
+      name: "ILONLY clear with unreadable metadata",
+      options: { cliFlags: 0, corruptMetadataSignature: true },
+      mixed: true,
+    },
+    { name: "pure IL", options: {}, mixed: false },
+    { name: "ReadyToRun", options: { readyToRun: true }, mixed: true },
+  ])("agrees with artifact classification for $name", ({ options, mixed }) => {
+    const bytes = buildManagedPeFixture(options);
+    const target = managedPeFixtureTarget(bytes);
+    const artifact = inspectManagedArtifactBytes(bytes, target);
+    const boundaries = inspectManagedNativeBoundariesBytes(bytes, target);
+
+    expect(boundaries.summary.mixed_mode_or_native_header).toBe(mixed);
+    if (artifact.classification.runtime_family === "mixed-clr-native")
+      expect(boundaries.summary.mixed_mode_or_native_header).toBe(true);
+  });
 });
 
 describe("managed native boundary coded indexes", () => {
@@ -280,7 +309,11 @@ describe("managed native boundary inspection", () => {
 
 describe("independent managed metadata facets", () => {
   it("preserves identity, members, and imports when embedded resources are malformed", () => {
-    const bytes = buildManagedPeFixture({ pinvoke: {}, readyToRun: true });
+    const bytes = buildManagedPeFixture({
+      mvid: Buffer.from("3aebc60edc4a544b1f458b4ed40b33b1", "hex"),
+      pinvoke: {},
+      readyToRun: true,
+    });
     bytes.writeUInt32LE(0x7fff_0000, 0x0200 + 24);
     const target = managedPeFixtureTarget(bytes);
     const artifact = inspectManagedArtifactBytes(bytes, target);
@@ -288,7 +321,7 @@ describe("independent managed metadata facets", () => {
     const native = inspectManagedNativeBoundariesBytes(bytes, target);
 
     for (const result of [artifact, members, native]) {
-      expect(result.module?.mvid).toBeTruthy();
+      expect(result.module?.mvid).toBe("0ec6eb3a-4adc-4b54-1f45-8b4ed40b33b1");
       expect(result.metadata.status).toBe("partial");
       expect(result.coverage).toMatchObject({
         state: "partial",
@@ -300,6 +333,17 @@ describe("independent managed metadata facets", () => {
         ]),
       });
     }
+    expect({
+      artifact: native.artifact,
+      module: native.module,
+      metadata: native.metadata,
+      identity_scope: native.identity_scope,
+    }).toEqual({
+      artifact: members.artifact,
+      module: members.module,
+      metadata: members.metadata,
+      identity_scope: members.identity_scope,
+    });
     expect(members.methods[0]?.name).toBe("Main");
     expect(native.pinvoke_imports[0]?.import_name).toBe("MessageBoxW");
     expect(native.cli_native?.ready_to_run_signature).toBe(true);

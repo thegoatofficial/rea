@@ -11,7 +11,8 @@ import {
 } from "@zip.js/zip.js";
 import { describe, expect, it } from "vitest";
 
-import { inventoryArtifact } from "../../../src/artifacts/inventory/ArtifactInventory.js";
+import { inventoryArtifact } from "../../fixtures/artifactInventory.js";
+import { asarHeaderBytes } from "../../fixtures/asarHeader.js";
 import {
   artifactOccurrenceAt,
   artifactParentPaths,
@@ -48,6 +49,88 @@ const expectedNestedParents = {
   "resources/app.asar/ordinary.asar": "resources/app.asar",
 };
 
+describe("ASAR JSON signature boundaries", () => {
+  it("expands a nested ASAR with a long legal JSON prefix and retains exact bytes", async () => {
+    const root = await createTestTempDirectory("rea-asar-json-whitespace-");
+    const application = join(root, "application");
+    const archivePath = join(application, "resources", "app.asar");
+    const archiveBytes = asarHeaderBytes(
+      `${" ".repeat(8_193)}\t\r\n${JSON.stringify({
+        files: { "main.js": { size: 0, offset: "0" } },
+      })}\r\n `,
+    );
+    await mkdir(join(application, "resources"), { recursive: true });
+    await writeFile(archivePath, archiveBytes);
+
+    const inventory = await inventoryArtifact(application);
+    expect(artifactParentPaths(inventory)).toEqual({
+      ".": null,
+      resources: ".",
+      "resources/app.asar": "resources",
+      "resources/app.asar/main.js": "resources/app.asar",
+    });
+    const container = artifactOccurrenceAt(inventory, "resources/app.asar");
+    expect(container).toMatchObject({
+      artifact_kind: "container",
+      artifact_format: "asar",
+      hash_status: "verified",
+    });
+    const direct = await inventoryArtifact(archivePath);
+    expect(container.artifact_id).toBe(direct.manifest.root_artifact_id);
+    expect(
+      inventory.nodes.find(
+        ({ artifact_id }) => artifact_id === container.artifact_id,
+      )?.sha256,
+    ).toBe(createHash("sha256").update(archiveBytes).digest("hex"));
+    expect(
+      artifactOccurrenceAt(inventory, "resources/app.asar/main.js").artifact_id,
+    ).toBe(artifactOccurrenceAt(direct, "main.js").artifact_id);
+    expect(await inventoryArtifact(application)).toEqual(inventory);
+  });
+
+  it.each([
+    { label: "vertical tab", prefix: "\v", padding: undefined },
+    { label: "form feed", prefix: "\f", padding: undefined },
+    { label: "nonbreaking space", prefix: "\u00a0", padding: undefined },
+    { label: "byte order mark", prefix: "\ufeff", padding: undefined },
+    {
+      label: "pickle padding outside jsonBytes",
+      prefix: " ",
+      padding: Buffer.from("{"),
+    },
+  ])("requires an object within jsonBytes for $label", async (fixture) => {
+    const root = await createTestTempDirectory("rea-asar-invalid-json-space-");
+    const json =
+      fixture.padding === undefined
+        ? `${fixture.prefix}${JSON.stringify({
+            files: { "main.js": { size: 0, offset: "0" } },
+          })}`
+        : fixture.prefix;
+    const invalid = asarHeaderBytes(
+      json,
+      fixture.padding === undefined ? {} : { padding: fixture.padding },
+    );
+    const writer = new ZipWriter(new Uint8ArrayWriter());
+    await writer.add("resources/app.asar", new Uint8ArrayReader(invalid));
+    const outerPath = join(root, "opaque.zip");
+    await writeFile(outerPath, await writer.close());
+
+    const inventory = await inventoryArtifact(outerPath);
+    expect(artifactOccurrenceAt(inventory, "resources/app.asar")).toMatchObject(
+      {
+        artifact_kind: "resource",
+        artifact_format: "file",
+        hash_status: "verified",
+      },
+    );
+    expect(
+      inventory.occurrences.some(({ logical_path }) =>
+        logical_path.startsWith("resources/app.asar/"),
+      ),
+    ).toBe(false);
+  });
+});
+
 describe("expanded ASAR inventory containment", () => {
   it("parents expanded members to their archive without changing byte identities", async () => {
     const { application, archive } = await createNestedAsar();
@@ -75,10 +158,9 @@ describe("expanded ASAR inventory containment", () => {
       const child = artifactOccurrenceAt(nested, path);
       expect(nested.edges).toContainEqual(
         expect.objectContaining({
-          logical_path: path,
+          occurrence_id: child.occurrence_id,
           relation: "contains",
           parent_artifact_id: artifactOccurrenceAt(nested, parent).artifact_id,
-          child_artifact_id: child.artifact_id,
         }),
       );
       if (path.startsWith("resources/app.asar/"))
@@ -155,9 +237,23 @@ describe("unexpanded ASAR inventory controls", () => {
       "resources/encrypted.asar": "resources",
       "resources/ordinary.asar": "resources",
     });
+    expect(artifactOccurrenceAt(observed, "resources/app.asar")).toMatchObject({
+      artifact_kind: "container",
+      artifact_format: "asar",
+    });
     expect(
-      artifactOccurrenceAt(observed, "resources/encrypted.asar").hash_status,
-    ).toBe("unavailable");
+      artifactOccurrenceAt(observed, "resources/ordinary.asar"),
+    ).toMatchObject({ artifact_kind: "resource", artifact_format: "file" });
+    expect(
+      artifactOccurrenceAt(observed, "resources/encrypted.asar"),
+    ).toMatchObject({
+      artifact_kind: "unknown",
+      artifact_format: "unknown",
+      hash_status: "unavailable",
+      limitations: [
+        "The path suffix suggests ASAR, but these bytes were not read, so the container family is unknown.",
+      ],
+    });
   });
 
   it("keeps ASAR-named directories as directory parents", async () => {
@@ -196,9 +292,27 @@ describe("unexpanded ASAR inventory controls", () => {
     },
   );
 
-  it("keeps malformed filesystem archives rejected", async () => {
-    const root = await createTestTempDirectory("rea-malformed-asar-");
+  it("records filesystem files without an ASAR header as ordinary bytes", async () => {
+    const root = await createTestTempDirectory("rea-ordinary-asar-");
     await writeFile(join(root, "ordinary.asar"), "ordinary bytes");
+    const observed = await inventoryArtifact(root);
+    expect(artifactParentPaths(observed)).toEqual({
+      ".": null,
+      "ordinary.asar": ".",
+    });
+    expect(artifactOccurrenceAt(observed, "ordinary.asar")).toMatchObject({
+      artifact_kind: "resource",
+      artifact_format: "file",
+      hash_status: "verified",
+    });
+  });
+
+  it("keeps filesystem archives with a malformed ASAR header rejected", async () => {
+    const root = await createTestTempDirectory("rea-malformed-asar-");
+    await writeFile(
+      join(root, "broken.asar"),
+      asarHeaderBytes('{"files":{not-json}}'),
+    );
     await expect(inventoryArtifact(root)).rejects.toMatchObject({
       reason: "format",
     });

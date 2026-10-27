@@ -1,24 +1,25 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import {
+  analysisCliErrorEnvelopeSchema,
+  analysisErrorProjectionSchema,
+} from "../../../src/contracts/errorSchemas.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
 
-const invalidRootOutput = {
+const unsupportedHostOutput = expect.objectContaining({
   error: "Import failed",
-  category: "invalid_input",
-  message:
-    "Reference source directory could not be opened. Check that the path exists, is readable, and points to a directory.",
-};
+  category: "unsupported_provider",
+  message: expect.stringContaining(
+    "Safe no-follow file opens are unavailable on this host.",
+  ),
+});
 
-const unsupportedHostOutput = {
-  error: "Import failed",
-  category: "unsupported_host",
-  message:
-    "Safe no-follow file opens are unavailable on this host. Import the source tree with REA on Linux (including WSL) or macOS.",
-};
+const permissionChecksUnavailable =
+  process.platform === "win32" || process.getuid?.() === 0;
 
 describe("compiled Windows reference-source import", () => {
   for (const scenario of [
@@ -50,8 +51,14 @@ describe("compiled Windows reference-source import", () => {
         expect(result.json).toEqual(
           scenario.fullOutput
             ? expect.objectContaining({
-                ok: true,
-                data: unsupportedHostOutput,
+                ok: false,
+                error: expect.objectContaining({
+                  code: "capability_unavailable",
+                  category: "unsupported_provider",
+                  message: expect.stringContaining(
+                    "Safe no-follow file opens are unavailable on this host.",
+                  ),
+                }),
               })
             : unsupportedHostOutput,
         );
@@ -83,7 +90,11 @@ describe("compiled reference-source import preflight failures", () => {
         const directory = await createTestTempDirectory(
           "rea-reference-cli-status-",
         );
-        const root = join(directory, "input");
+        // Exercise JSON escaping on POSIX too; Windows paths already need it.
+        const root = join(
+          directory,
+          process.platform === "win32" ? "input" : "input\\escaped",
+        );
         if (scenario.rootKind === "regular-file")
           await writeFile(root, "inert input\n");
         const result = await cli.run({
@@ -102,16 +113,45 @@ describe("compiled reference-source import preflight failures", () => {
             ...(scenario.logging ? { REA_LOG_LEVEL: "info" } : {}),
           },
         });
+        const rootReason =
+          scenario.rootKind === "missing"
+            ? "Reference source root could not be resolved"
+            : "Reference source root is not a directory";
+        const invalidRootOutput = {
+          category: "invalid_input",
+          message: expect.stringContaining(rootReason),
+        };
         if (scenario.fullOutput) {
-          // Incur's legacy wrapper remains unchanged; operation status is
-          // conveyed by the exit code and command log, not this `ok` field.
           expect(result.json).toMatchObject({
-            ok: true,
-            data: invalidRootOutput,
+            ok: false,
+            error: invalidRootOutput,
           });
         } else {
-          expect(result.json).toEqual(invalidRootOutput);
+          expect(result.json).toMatchObject({
+            ...invalidRootOutput,
+            error: "Import failed",
+          });
         }
+        const projection = scenario.fullOutput
+          ? (result.json as { error: unknown }).error
+          : result.json;
+        expect(
+          (scenario.fullOutput
+            ? analysisErrorProjectionSchema
+            : analysisCliErrorEnvelopeSchema
+          ).safeParse(projection).success,
+        ).toBe(true);
+        const messagePath = scenario.fullOutput ? "error.message" : "message";
+        expect(result.json).toHaveProperty(
+          messagePath,
+          expect.stringContaining(
+            "Check that the path exists, is readable, and points to a directory.",
+          ),
+        );
+        expect(result.json).toHaveProperty(
+          messagePath,
+          expect.stringContaining(root),
+        );
         expect.soft(result.exitCode).toBe(1);
         if (scenario.logging) {
           const records: unknown[] = result.stderr
@@ -132,4 +172,45 @@ describe("compiled reference-source import preflight failures", () => {
       },
     );
   }
+
+  cliTest.skipIf(permissionChecksUnavailable)(
+    "classifies a blocked parent directory as an execution failure",
+    async ({ cli }) => {
+      const directory = await createTestTempDirectory(
+        "rea-reference-cli-blocked-root-",
+      );
+      const parent = join(directory, "blocked-parent");
+      const root = join(parent, "input");
+      await mkdir(root, { recursive: true });
+      await chmod(parent, 0);
+      try {
+        const result = await cli.run({
+          arguments: ["import-reference-source", root, "--json"],
+          cwd: directory,
+          environment: {
+            HOME: directory,
+            USERPROFILE: directory,
+            XDG_CONFIG_HOME: directory,
+            XDG_CACHE_HOME: directory,
+          },
+        });
+        expect(result.json).toMatchObject({
+          error: "Import failed",
+          category: "execution_failure",
+          message: expect.stringContaining("EACCES: permission denied"),
+        });
+        expect(result.json).toHaveProperty(
+          "message",
+          expect.stringContaining(root),
+        );
+        expect(result.json).toHaveProperty(
+          "message",
+          expect.stringContaining("Check directory permissions and try again."),
+        );
+        expect(result.exitCode).toBe(1);
+      } finally {
+        await chmod(parent, 0o700);
+      }
+    },
+  );
 });

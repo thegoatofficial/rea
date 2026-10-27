@@ -1,9 +1,14 @@
 import { expect, it } from "vitest";
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import {
+  captureDecoderHeapRecovery,
+  DEFAULT_CAPTURE_DECODER_HEAP,
+} from "../../config/captureDecoderHeap.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
 import { analysisErrorProjectionSchema } from "../../contracts/errorSchemas.js";
 import { inspectWebNetworkCaptureInputSchema } from "../../domain/webNetworkCapture.js";
 import { historicalCaptureFailure } from "./CaptureFailures.js";
+import { NODE_CAPTURE_PROCESS_MEMORY_LIMIT_BYTES } from "./CaptureRelease.js";
 import { redactExplicitFailure } from "../../domain/explicitSensitiveFailure.js";
 import { OwnedCommandFailure } from "../../process/OwnedCommand.js";
 
@@ -20,8 +25,12 @@ it.each([
     const stderr =
       "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\r\n";
     const cause = new OwnedCommandFailure("process", "Decoder failed", {
-      stdout: { text: "", bytes: 0 },
-      stderr: { text: stderr, bytes: Buffer.byteLength(stderr) },
+      stdout: { text: "", bytes: 0, observedBytes: 0 },
+      stderr: {
+        text: stderr,
+        bytes: Buffer.byteLength(stderr),
+        observedBytes: Buffer.byteLength(stderr),
+      },
       exitCode,
       signal,
     });
@@ -31,10 +40,9 @@ it.each([
     expect(projected).toMatchObject({
       code: "resource_constraint",
       retryable: false,
-      message: expect.stringContaining("fixed V8 heap"),
       remediation: {
         action: expect.stringContaining(
-          "smaller capture exported by its producer",
+          captureDecoderHeapRecovery(DEFAULT_CAPTURE_DECODER_HEAP),
         ),
       },
       details: {
@@ -46,7 +54,97 @@ it.each([
         captured_output: { stdout: "", stderr },
       },
     });
-    expect(JSON.stringify(projected)).not.toContain("rea doctor");
+    // Bun ignores the decoder's V8 heap flags, so no fixed heap is reported.
+    const heapLimits = {
+      old_generation_heap_mib: 192,
+      old_generation_heap_source: "default",
+      semi_space_heap_mib: 8,
+    };
+    if (process.versions.bun === undefined)
+      expect(projected).toMatchObject({
+        details: { reported_limits: heapLimits },
+      });
+    else
+      expect(projected).not.toMatchObject({
+        details: { reported_limits: { old_generation_heap_mib: 192 } },
+      });
+  },
+);
+
+// Measured Bun 1.4.2 outcomes at a Job Object commit limit: a 512 MiB limit
+// panicked with exit 3 and a 256 MiB limit threw a JavaScript out-of-memory
+// exception with exit 1. Only the job notification identifies both.
+it.each([
+  { label: "a runtime panic", exitCode: 3, stderr: "panic: out of memory" },
+  {
+    label: "a JavaScript exception",
+    exitCode: 1,
+    stderr: "RangeError: Out of memory",
+  },
+])(
+  "reports a reached Job Object memory limit after $label",
+  ({ exitCode, stderr }) => {
+    const input = inspectWebNetworkCaptureInputSchema.parse({
+      capture_path: "/selected/input.har",
+      format: "har",
+    });
+    const snapshot = {
+      stdout: { text: "", bytes: 0, observedBytes: 0 },
+      stderr: {
+        text: stderr,
+        bytes: Buffer.byteLength(stderr),
+        observedBytes: Buffer.byteLength(stderr),
+      },
+      exitCode,
+      signal: null,
+    };
+    const projected = analysisErrorProjectionSchema.parse(
+      projectAnalysisError(
+        historicalCaptureFailure(
+          input,
+          new OwnedCommandFailure("process", "Decoder failed", {
+            ...snapshot,
+            memoryLimitReached: true,
+          }),
+          "decoder",
+        ),
+      ),
+    );
+    expect(projected).toMatchObject({
+      code: "resource_constraint",
+      details: {
+        resource: "memory",
+        reported_limits: {
+          format: "har",
+          observed_exit_code: exitCode,
+          observed_signal: null,
+        },
+        captured_output: { stderr },
+      },
+    });
+    // The enforced limit is reported only where Bun runs on Windows.
+    if (NODE_CAPTURE_PROCESS_MEMORY_LIMIT_BYTES === null)
+      expect(projected.details?.reported_limits).not.toHaveProperty(
+        "process_memory_limit_bytes",
+      );
+    else
+      expect(projected).toMatchObject({
+        details: {
+          reported_limits: {
+            process_memory_limit_bytes: NODE_CAPTURE_PROCESS_MEMORY_LIMIT_BYTES,
+          },
+        },
+      });
+    // The same exit without the job notification remains an ordinary failure.
+    expect(
+      projectAnalysisError(
+        historicalCaptureFailure(
+          input,
+          new OwnedCommandFailure("process", "Decoder failed", snapshot),
+          "decoder",
+        ),
+      ),
+    ).toMatchObject({ code: "execution_failure" });
   },
 );
 
@@ -70,8 +168,12 @@ it.each([
       format: "har",
     });
     const cause = new OwnedCommandFailure("process", "Decoder failed", {
-      stdout: { text: "", bytes: 0 },
-      stderr: { text: stderr, bytes: Buffer.byteLength(stderr) },
+      stdout: { text: "", bytes: 0, observedBytes: 0 },
+      stderr: {
+        text: stderr,
+        bytes: Buffer.byteLength(stderr),
+        observedBytes: Buffer.byteLength(stderr),
+      },
       exitCode,
       signal,
     });
@@ -109,7 +211,6 @@ it.each(["before open", "during read"])(
         reason: cause.message,
       },
     });
-    expect(projected.remediation.action).toContain("stable");
     const redacted = projectAnalysisError(
       redactExplicitFailure(error, ["private-marker", "REDACTED"]),
     );
@@ -128,8 +229,16 @@ it("retains actual command status and both diagnostic streams when cleanup also 
     "process",
     "Observed command failure",
     {
-      stdout: { text: "original provider output", bytes: 24 },
-      stderr: { text: "private-marker provider reason", bytes: 30 },
+      stdout: {
+        text: "original provider output",
+        bytes: 24,
+        observedBytes: 24,
+      },
+      stderr: {
+        text: "private-marker provider reason",
+        bytes: 30,
+        observedBytes: 30,
+      },
       exitCode: 2,
       signal: null,
     },
@@ -176,3 +285,43 @@ it.each(["io", "unavailable"] as const)(
     });
   },
 );
+
+it("preserves the exact cancellation reason and an earlier reader failure", () => {
+  const input = inspectWebNetworkCaptureInputSchema.parse({
+    capture_path: "/selected/input.har",
+    format: "har",
+  });
+  const reason = { request: "caller cancellation" };
+  const controller = new AbortController();
+  controller.abort(reason);
+  const cancelledCommand = new OwnedCommandFailure(
+    "cancelled",
+    "Command cancelled",
+    null,
+    null,
+    { cancellation: { reason } },
+  );
+  expect(
+    historicalCaptureFailure(input, cancelledCommand, "decoder", {
+      signal: controller.signal,
+    }).cause,
+  ).toBe(reason);
+  const cancelledRead = new ArtifactReaderFailure(
+    "cancelled",
+    "Read cancelled",
+    { cancellation: { reason } },
+  );
+  expect(
+    historicalCaptureFailure(input, cancelledRead, "capture-read", {
+      signal: controller.signal,
+    }).cause,
+  ).toBe(reason);
+
+  const changed = historicalCaptureFailure(
+    input,
+    new ArtifactReaderFailure("integrity", "Observed changed capture"),
+    "capture-read",
+    { signal: controller.signal },
+  );
+  expect(changed._tag).toBe("AnalysisArtifactChangedError");
+});

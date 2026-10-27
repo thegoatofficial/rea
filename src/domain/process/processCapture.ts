@@ -2,7 +2,12 @@ import { z } from "zod";
 import { jsonValueSchema } from "../jsonValue.js";
 
 import { normalizationSchema } from "./processScenario.js";
-import { collectProcessCaptureIssues } from "./processCaptureValidation.js";
+import {
+  collectProcessCaptureIssues,
+  finalizationAgreementIssue,
+  finalizationConsistencyIssue,
+  finalizationManifestIssue,
+} from "./processCaptureValidation.js";
 import {
   filesystemCoverageSchema,
   processCaptureTruncationDetailsSchema,
@@ -42,6 +47,21 @@ export interface InteractionEvent {
   readonly outcome: "dispatched" | "target_exited" | "failed";
 }
 
+/** Observed finalization attempts after a deadline fired. */
+export interface ProcessCaptureFinalization {
+  readonly requested_ms: number;
+  readonly elapsed_ms: number | null;
+  /** Code the PTY reported for an exit not caused by a signal; otherwise null. */
+  readonly exit_code: number | null;
+  readonly signals: readonly {
+    readonly signal: "SIGTERM" | "SIGKILL";
+    readonly sent_at_ms: number;
+    readonly delivery: "signaled" | "gone" | "identity-changed" | "unverified";
+    /** Why delivery could not be verified; present only for unverified attempts. */
+    readonly reason?: string | undefined;
+  }[];
+}
+
 /** One filesystem state used for before/after comparison. */
 interface FileStateIdentity {
   readonly path: string;
@@ -72,7 +92,7 @@ export type FileState = FileStateIdentity &
 export interface ProcessFilesystemSnapshot {
   readonly files: readonly FileState[];
   readonly truncated: boolean;
-  /** Root aliases whose path enumeration was exhausted, regardless of hash coverage. */
+  /** Physical root enumeration exhausted; unfollowed symlink scopes remain unknown. */
   readonly completeRoots: readonly string[];
   readonly coverage: FilesystemCoverage;
 }
@@ -209,6 +229,7 @@ export interface UnverifiedProcessCapture {
     readonly code: number | null;
     readonly signal: number | null;
     readonly reason: "exited" | "timeout" | "idle_timeout";
+    readonly finalization?: ProcessCaptureFinalization | undefined;
   };
   readonly settlement: VerifiedProcessSettlement;
   readonly process_samples: readonly ProcessSample[];
@@ -246,8 +267,8 @@ export interface UnverifiedProcessCapture {
 
 const fileStateShape = {
   path: z.string(),
-  mode: z.number().int().nonnegative(),
-  size: z.number().int().nonnegative(),
+  mode: z.int().nonnegative(),
+  size: z.int().nonnegative(),
 };
 
 /** An unrelated process left untouched because its ownership is unknown. */
@@ -290,7 +311,11 @@ export interface IncompleteProcessCaptureObservations {
     readonly code: number | null;
     readonly signal: number | null;
     readonly reason: "exited" | "timeout" | "idle_timeout" | "cancelled";
+    readonly finalization?: ProcessCaptureFinalization | undefined;
   }>;
+  readonly finalization?:
+    | PartialProcessObservationField<ProcessCaptureFinalization>
+    | undefined;
   readonly settlement: PartialProcessObservationField<{
     readonly state: "quiesced" | "alive_at_deadline" | "unverifiable";
     readonly elapsed_ms: number;
@@ -371,19 +396,57 @@ const fileEffectSchema = z.discriminatedUnion("status", [
 const processSettlementSchema = z.discriminatedUnion("state", [
   z.object({
     state: z.literal("quiesced"),
-    elapsed_ms: z.number().int().nonnegative(),
+    elapsed_ms: z.int().nonnegative(),
     cleanup_outcome: z.enum(["not_required", "failed"]),
   }),
   z.object({
     state: z.enum(["alive_at_deadline", "unverifiable"]),
-    elapsed_ms: z.number().int().nonnegative(),
+    elapsed_ms: z.int().nonnegative(),
     cleanup_outcome: z.enum(["cleaned", "failed"]),
   }),
 ]);
 
 const unverifiedCleanupProcessesSchema = z.array(
-  z.strictObject({ pid: z.number().int().positive(), reason: z.string() }),
+  z.strictObject({ pid: z.int().positive(), reason: z.string() }),
 );
+
+const processCaptureFinalizationSchema = z
+  .strictObject({
+    requested_ms: z.int().safe().positive(),
+    elapsed_ms: z.int().nonnegative().nullable(),
+    exit_code: z.int().nonnegative().nullable(),
+    signals: z
+      .array(
+        z.strictObject({
+          signal: z.enum(["SIGTERM", "SIGKILL"]),
+          sent_at_ms: z.int().nonnegative(),
+          delivery: z.enum([
+            "signaled",
+            "gone",
+            "identity-changed",
+            "unverified",
+          ]),
+          reason: z.string().min(1).optional(),
+        }),
+      )
+      .min(1),
+  })
+  .superRefine((finalization, context) => {
+    if (finalization.exit_code !== null && finalization.elapsed_ms === null)
+      context.addIssue({
+        code: "custom",
+        path: ["exit_code"],
+        message: "finalization exit_code requires an observed exit",
+      });
+    for (const [index, attempt] of finalization.signals.entries())
+      if (attempt.reason !== undefined && attempt.delivery !== "unverified")
+        context.addIssue({
+          code: "custom",
+          path: ["signals", index, "reason"],
+          message:
+            "finalization reason is only allowed for an unverified delivery",
+        });
+  });
 
 const processCaptureShapeSchema = z.strictObject({
   manifest: z.strictObject({
@@ -415,20 +478,20 @@ const processCaptureShapeSchema = z.strictObject({
   normalization: normalizationSchema,
   frames: z.array(
     z.object({
-      sequence: z.number().int().nonnegative(),
-      at_ms: z.number().int().nonnegative(),
+      sequence: z.int().nonnegative(),
+      at_ms: z.int().nonnegative(),
       data: z.string(),
       raw_data: z.string().optional(),
     }),
   ),
   rendered_frames: z.array(
     z.object({
-      sequence: z.number().int().nonnegative(),
-      at_ms: z.number().int().nonnegative(),
-      columns: z.number().int().positive(),
-      rows: z.number().int().positive(),
-      cursor_x: z.number().int().nonnegative(),
-      cursor_y: z.number().int().nonnegative(),
+      sequence: z.int().nonnegative(),
+      at_ms: z.int().nonnegative(),
+      columns: z.int().positive(),
+      rows: z.int().positive(),
+      cursor_x: z.int().nonnegative(),
+      cursor_y: z.int().nonnegative(),
       active_buffer: z.enum(["normal", "alternate"]),
       lines: z.array(z.string()),
       serialized_state: z.string(),
@@ -436,45 +499,46 @@ const processCaptureShapeSchema = z.strictObject({
   ),
   interaction_events: z.array(
     z.object({
-      sequence: z.number().int().nonnegative(),
-      scheduled_at_ms: z.number().int().nonnegative(),
-      dispatched_at_ms: z.number().int().nonnegative(),
+      sequence: z.int().nonnegative(),
+      scheduled_at_ms: z.int().nonnegative(),
+      dispatched_at_ms: z.int().nonnegative(),
       type: z.enum(["input", "resize", "signal"]),
       data: z.string(),
       outcome: z.enum(["dispatched", "target_exited", "failed"]),
     }),
   ),
   exit: z.object({
-    code: z.number().int().nullable(),
-    signal: z.number().int().nullable(),
+    code: z.int().nullable(),
+    signal: z.int().nullable(),
     reason: z.enum(["exited", "timeout", "idle_timeout"]),
+    finalization: processCaptureFinalizationSchema.optional(),
   }),
   settlement: z.discriminatedUnion("state", [
     z.object({
       state: z.literal("quiesced"),
-      elapsed_ms: z.number().int().nonnegative(),
+      elapsed_ms: z.int().nonnegative(),
       cleanup_outcome: z.literal("not_required"),
     }),
     z.object({
       state: z.enum(["alive_at_deadline", "unverifiable"]),
-      elapsed_ms: z.number().int().nonnegative(),
+      elapsed_ms: z.int().nonnegative(),
       cleanup_outcome: z.enum(["cleaned", "failed"]),
     }),
   ]),
   process_samples: z.array(
     z.object({
-      at_ms: z.number().int().nonnegative(),
-      pid: z.number().int().positive(),
-      parent_pid: z.number().int().nonnegative(),
+      at_ms: z.int().nonnegative(),
+      pid: z.int().positive(),
+      parent_pid: z.int().nonnegative(),
       command: z.string(),
-      process_group_id: z.number().int().positive().nullable(),
-      session_id: z.number().int().nonnegative().nullable(),
+      process_group_id: z.int().positive().nullable(),
+      session_id: z.int().nonnegative().nullable(),
     }),
   ),
   filesystem_checkpoints: z.array(
     z.object({
       name: z.enum(["before", "after_settlement"]),
-      at_ms: z.number().int().nonnegative(),
+      at_ms: z.int().nonnegative(),
       files: z.array(fileStateSchema),
       effects: z.array(fileEffectSchema),
       truncated: z.boolean(),
@@ -482,9 +546,9 @@ const processCaptureShapeSchema = z.strictObject({
   ),
   event_journal: z.array(
     z.object({
-      capture_order: z.number().int().nonnegative(),
+      capture_order: z.int().nonnegative(),
       collection: z.enum(PROCESS_CAPTURE_EVENT_COLLECTIONS),
-      index: z.number().int().nonnegative(),
+      index: z.int().nonnegative(),
     }),
   ),
   files_before: z.array(fileStateSchema),
@@ -530,7 +594,7 @@ const partialObservationFieldSchema = <Schema extends z.ZodType>(
   ]);
 
 const incompleteProcessCaptureObservationsSchema = z.strictObject({
-  target_pid: partialObservationFieldSchema(z.number().int().positive()),
+  target_pid: partialObservationFieldSchema(z.int().positive()),
   frames: partialObservationFieldSchema(processCaptureShapeSchema.shape.frames),
   rendered_frames: partialObservationFieldSchema(
     processCaptureShapeSchema.shape.rendered_frames,
@@ -540,15 +604,19 @@ const incompleteProcessCaptureObservationsSchema = z.strictObject({
   ),
   exit: partialObservationFieldSchema(
     z.strictObject({
-      code: z.number().int().nullable(),
-      signal: z.number().int().nullable(),
+      code: z.int().nullable(),
+      signal: z.int().nullable(),
       reason: z.enum(["exited", "timeout", "idle_timeout", "cancelled"]),
+      finalization: processCaptureFinalizationSchema.optional(),
     }),
   ),
+  finalization: partialObservationFieldSchema(
+    processCaptureFinalizationSchema,
+  ).optional(),
   settlement: partialObservationFieldSchema(
     z.strictObject({
       state: z.enum(["quiesced", "alive_at_deadline", "unverifiable"]),
-      elapsed_ms: z.number().int().nonnegative(),
+      elapsed_ms: z.int().nonnegative(),
     }),
   ),
   process_samples: partialObservationFieldSchema(
@@ -604,6 +672,84 @@ export const partialProcessCaptureObservationSchema = z
         path: ["execution_failure"],
         message:
           "partial observations require incomplete cleanup or an execution failure",
+      });
+
+    const observedExit =
+      "capture" in partial
+        ? partial.capture.exit
+        : partial.observations.exit.state === "available"
+          ? partial.observations.exit.value
+          : undefined;
+    const observedFinalization =
+      "observations" in partial &&
+      partial.observations.finalization?.state === "available"
+        ? partial.observations.finalization.value
+        : undefined;
+    const committedManifest =
+      "capture" in partial
+        ? partial.capture.manifest
+        : partial.observations.manifest.state === "available"
+          ? partial.observations.manifest.value
+          : undefined;
+    const manifestFinalizationIssue = finalizationManifestIssue(
+      committedManifest?.scenario,
+      committedManifest?.comparison_contract,
+    );
+    const exitFinalizationIssue =
+      manifestFinalizationIssue ??
+      (observedExit === undefined
+        ? undefined
+        : finalizationConsistencyIssue(
+            observedExit,
+            committedManifest?.scenario,
+            committedManifest?.comparison_contract,
+          ));
+    const incompleteFinalizationIssue =
+      manifestFinalizationIssue ??
+      (observedFinalization === undefined
+        ? undefined
+        : finalizationConsistencyIssue(
+            observedExit === undefined
+              ? undefined
+              : { reason: observedExit.reason, signal: observedExit.signal },
+            committedManifest?.scenario,
+            committedManifest?.comparison_contract,
+            { finalization: observedFinalization, allowNullElapsedMs: true },
+          ));
+    if (exitFinalizationIssue !== undefined)
+      context.addIssue({
+        code: "custom",
+        path: ["exit"],
+        message: exitFinalizationIssue,
+      });
+    if (incompleteFinalizationIssue !== undefined)
+      context.addIssue({
+        code: "custom",
+        path: ["finalization"],
+        message: incompleteFinalizationIssue,
+      });
+
+    const agreementIssue = finalizationAgreementIssue(
+      observedExit?.finalization,
+      observedFinalization,
+    );
+    if (agreementIssue !== undefined)
+      context.addIssue({
+        code: "custom",
+        path: ["finalization"],
+        message: agreementIssue,
+      });
+    if (
+      "observations" in partial &&
+      partial.observations.exit.state === "unavailable" &&
+      observedFinalization !== undefined &&
+      observedFinalization?.elapsed_ms !== null
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["finalization"],
+        message:
+          "finalization elapsed_ms must be null when the exit observation is unavailable",
       });
 
     if ("observations" in partial) {

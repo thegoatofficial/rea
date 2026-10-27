@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { javaScriptRouteInventorySchema } from "./javascriptRouteInventory.js";
+import { canBorrowParsedJsonSnapshot } from "../immutableJson.js";
 
 import {
   javascriptApplicationGraphSchema,
@@ -13,15 +15,23 @@ import {
 import { digestSchema } from "../digests.js";
 import { prefixedDigestSchema } from "../digests.js";
 import { integrityContradictionSchema } from "../artifactGraph.js";
+import { artifactIntegrityPolicySchema } from "../artifactIntegrityPolicy.js";
 import { localPathStringSchema } from "../localPath.js";
+import { javaScriptAnalysisResourceControlsSchema } from "./javascriptAnalysisResourceControls.js";
+import {
+  javaScriptSourcePathsSchema,
+  javaScriptSourceSelectionSchema,
+} from "./javascriptSourceSelection.js";
 
-const countSchema = z.number().int().min(0);
+const countSchema = z.int().min(0);
 
 /** Public target-free request for static JavaScript application analysis. */
 export const analyzeJavaScriptApplicationInputSchema = z.strictObject({
   input_path: localPathStringSchema,
   format: z.enum(["auto", "asar", "directory"]).default("auto"),
-  integrity_policy: z.enum(["fail", "record-and-continue"]).default("fail"),
+  integrity_policy: artifactIntegrityPolicySchema,
+  source_paths: javaScriptSourcePathsSchema.optional(),
+  ...javaScriptAnalysisResourceControlsSchema.shape,
 });
 
 /** Compact counts for the high-level Electron architecture/security surface. */
@@ -55,6 +65,10 @@ const reconstructionStatisticsSchema = z.strictObject({
   text_bytes_read: countSchema,
   invalid_utf8_files: countSchema,
   parsed_javascript_files: countSchema,
+  // Old saved evidence predates this field: absence must stay unknown, not
+  // become a measured zero. The producer always writes it (required by the
+  // application-layer result type); readers treat a missing value as unknown.
+  skipped_javascript_files: countSchema.exactOptional(),
   visited_ast_nodes: countSchema,
   findings: countSchema,
   modules: countSchema,
@@ -68,11 +82,13 @@ const applicationAnalysisResultShape = z.strictObject({
   inventory_manifest_id: prefixedDigestSchema("agm"),
   inventory_graph_sha256: digestSchema,
   integrity_contradictions: z.array(integrityContradictionSchema),
+  source_selection: javaScriptSourceSelectionSchema.exactOptional(),
   graph: javascriptApplicationGraphSchema,
   summary: electronBoundarySummarySchema,
   statistics: reconstructionStatisticsSchema,
   limitations: z.array(z.string().min(1)),
   semantic_graph: javaScriptSemanticGraphSchema,
+  route_inventory: javaScriptRouteInventorySchema.exactOptional(),
 });
 
 type BindingIssue = {
@@ -159,21 +175,43 @@ const ownedAnalysisResultShape = applicationAnalysisResultShape.extend({
   ),
 });
 
+// One successful interpretation per exact immutable source. Weak keys retain
+// neither a second graph nor a source beyond its Evidence lifetime.
+const validatedImmutableResults = new WeakSet<object>();
+const isValidatedImmutableResult = (
+  input: unknown,
+): input is JavaScriptApplicationAnalysisResult =>
+  typeof input === "object" &&
+  input !== null &&
+  validatedImmutableResults.has(input);
+
 /** Reuse exact owned graphs while validating metadata and cross-graph bindings. */
 export function* parseOwnedJavaScriptApplicationAnalysisSteps(
   input: unknown,
 ): Generator<void, JavaScriptApplicationAnalysisResult> {
+  if (isValidatedImmutableResult(input)) return input;
   const prepared = ownedAnalysisResultShape.safeParse(input);
-  if (!prepared.success)
-    return javascriptApplicationAnalysisResultSchema.parse(input);
-  const issues: BindingIssue[] = [];
-  yield* checkApplicationBindingsSteps(prepared.data, {
-    addIssue: (issue) => {
-      issues.push(issue);
-    },
-  });
-  if (issues.length > 0) throw new z.ZodError(issues);
-  return prepared.data;
+  if (prepared.success) {
+    const issues: BindingIssue[] = [];
+    yield* checkApplicationBindingsSteps(prepared.data, {
+      addIssue: (issue) => {
+        issues.push(issue);
+      },
+    });
+    if (issues.length > 0) throw new z.ZodError(issues);
+    // Keep this existing fast path and its metadata normalization. Rewalking
+    // already owned graphs just to borrow the wrapper would add full-graph work.
+    return prepared.data;
+  }
+  const result = javascriptApplicationAnalysisResultSchema.parse(input);
+  // Borrow only if parsing preserved the exact representation. A future schema
+  // default/normalization must still return its parsed value, without caching.
+  // Admission follows full validation, including completion of yielding checks.
+  if (canBorrowParsedJsonSnapshot(input, result)) {
+    validatedImmutableResults.add(input);
+    return input;
+  }
+  return result;
 }
 
 /** Parsed public JavaScript application analysis request. */

@@ -7,11 +7,12 @@ import {
   cancelled,
   failure,
   filesystemFailureDetail,
+  rootFilesystemFailure,
 } from "./ReferenceSourceReaderErrors.js";
 import { isPathWithinRoot } from "../domain/localPath.js";
-import {
-  type ReferenceSourceFailureCode,
-  type ReferenceSourceResult,
+import type {
+  ReferenceSourceFailureCode,
+  ReferenceSourceResult,
 } from "./ReferenceSourceReaderTypes.js";
 
 export const bigLstat = (path: string): Promise<BigIntStats> =>
@@ -41,6 +42,7 @@ export const validateDirectory = async (
       readonly ok: false;
       readonly code: ReferenceSourceFailureCode;
       readonly message: string;
+      readonly localDiagnostic?: string;
     }
 > => {
   try {
@@ -75,15 +77,15 @@ export const validateDirectory = async (
         code: "cancelled",
         message: "Reference source traversal cancelled",
       };
-    const message = filesystemFailureDetail(
+    const detail = filesystemFailureDetail(
       cause,
       "Directory identity could not be verified",
     );
-    if (message === undefined) throw cause;
+    if (detail === undefined) throw cause;
     return {
       ok: false,
       code: "io",
-      message,
+      ...detail,
     };
   }
 };
@@ -120,11 +122,11 @@ export const prepareRoot = async (
     return ok({ canonicalRoot, rootIdentity: canonicalMetadata });
   } catch (cause: unknown) {
     if (isAborted(signal)) return err(cancelled());
-    const message = filesystemFailureDetail(
+    const rootFailure = rootFilesystemFailure(
       cause,
       "Reference source root could not be resolved",
     );
-    if (message === undefined) throw cause;
-    return err(failure("invalid-root", `${message}: ${root}`));
+    if (rootFailure === undefined) throw cause;
+    return err(failure(rootFailure.code, `${rootFailure.message}: ${root}`));
   }
 };
