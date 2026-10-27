@@ -26,3 +26,10 @@ ghidra-nativeaot) are not in the npm package and were not taken.
 Re-sync: read the new release's CHANGELOG and tool catalog, repeat REVIEW.md's checks against the
 new tarball, then bump the pin in three places together: `D:/AgentTools/rea/package.json`,
 `daedalus-skills/claude/plugins/rea/start-rea.mjs` (`PINNED`) and the plugin version.
+
+Source mirror, 2026-10-28: this branch (`intake/rea-6.8.0`) merges upstream tag `rea-agents-6.8.0`
+(`160d821ac9a0310afcb8d1fc427862dd6508add5`, 2026-10-25; MIT, root LICENSE unchanged from 6.3.0) and keeps
+the two intake commits above. The runtime pin is NOT moved by this merge: the 6.8.0 npm package
+(`sha512-9QDeRnGq...Zww==`) fails the maintainer's audit gate (zod 4.4.3, GHSA-mrhx-c7xc-m3w5, fixed on
+upstream main but unreleased) and changes 37 reviewed tool contracts; see claude/plugins/rea/SOURCE.md in
+daedalus-skills for the live runtime pin.
